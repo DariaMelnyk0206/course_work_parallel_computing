@@ -1,0 +1,11 @@
+# Local SDD / Kiro artifacts (must NOT be pushed to GitHub)
+.kiro/
+
+# Build & Dataset artifacts
+build/
+cmake-build-*/
+dataset/
+*.o
+*.a
+*.out
+.DS_Store
