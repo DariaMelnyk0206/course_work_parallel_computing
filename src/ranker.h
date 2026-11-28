@@ -22,6 +22,7 @@ struct SearchResult {
   std::string doc_id;  // File name (Requirement 17.2).
   double score;        // Rounded to 4 decimals, in (0, 1] (Requirement 16.6).
   std::string snippet;
+  std::string title;  // Book title from metadata.csv; may be empty.
 };
 
 // Computes score(d, Q) = sum(w(t)*IDF(t) for t matching d) /

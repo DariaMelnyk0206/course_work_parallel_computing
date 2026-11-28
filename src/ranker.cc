@@ -75,7 +75,7 @@ std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
   results.reserve(limit);
   for (size_t i = 0; i < limit; ++i) {
     const DocumentInfo& info = index.Documents().Get(scored[i].doc_id);
-    results.push_back({info.name, scored[i].score, info.snippet});
+    results.push_back({info.name, scored[i].score, info.snippet, info.title});
   }
   return results;
 }

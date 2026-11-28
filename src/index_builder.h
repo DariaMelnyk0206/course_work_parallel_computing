@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,20 @@ class IndexBuilder {
   // result has documents_indexed == 0 (Requirement 2.10).
   static IndexBuildResult Build(const std::string& dataset_dir,
                                 int num_threads);
+
+  // One metadata.csv row `id,title,year,url` (no header).
+  struct MetadataRow {
+    std::string id;
+    std::string title;
+    std::string year;
+  };
+
+  // `id` is the text up to the first comma, `url` the text after the last
+  // comma, `year` the text between the second-to-last and the last comma,
+  // `title` everything in the middle, so commas inside a title do not break
+  // parsing (Requirement 9.11). Returns std::nullopt for a row with fewer
+  // than three commas (the row is skipped and logged by the caller).
+  static std::optional<MetadataRow> ParseMetadataLine(const std::string& line);
 };
 
 }  // namespace search_engine

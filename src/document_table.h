@@ -9,9 +9,11 @@
 namespace search_engine {
 
 struct DocumentInfo {
-  std::string name;     // File name used as doc_id in API responses.
-  std::string snippet;  // Precomputed at index time (Requirement 12).
-  bool valid = false;   // False if the file could not be read.
+  std::string name;           // File name used as doc_id in API responses.
+  std::string relative_path;  // Path relative to the dataset directory.
+  std::string title;          // "<title> (<year>)" from metadata.csv or empty.
+  std::string snippet;        // Precomputed at index time (Requirement 12).
+  bool valid = false;         // False if the file could not be read.
 };
 
 // Metadata for all documents, indexed by uint32_t doc_id. The vector is
