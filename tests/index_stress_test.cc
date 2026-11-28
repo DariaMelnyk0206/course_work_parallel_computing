@@ -10,12 +10,15 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
+#include "striped_hash_table.h"
 #include "thread_pool.h"
 
 namespace {
@@ -373,6 +376,104 @@ void CheckEnqueueExceptionsKeepPoolAlive() {
   }
 }
 
+// Property 5: concurrent InsertBatch calls neither lose nor duplicate postings
+// (Requirements 7.1, 7.6, 7.8, 7.11). Several writer threads insert documents
+// (each with a set of unique terms) while reader threads call Lookup. A small
+// bucket/stripe count forces collisions inside buckets and stripes. After all
+// writers finish, Lookup(t) must hold exactly the doc_ids that inserted t,
+// each once; readers must never see a duplicate or an unknown doc_id.
+void CheckConcurrentInsertBatch() {
+  using search_engine::StripedHashTable;
+  using search_engine::StripedInsertItem;
+  for (uint32_t seed : kSeeds) {
+    std::mt19937 rng = MakeRng(seed);
+    const size_t buckets = size_t{1} << RandomInt(rng, 4, 8);
+    const size_t stripes = size_t{1} << RandomInt(rng, 0, 4);
+    const int num_writers = RandomInt(rng, 2, 8);
+    const int num_readers = RandomInt(rng, 1, 4);
+    const int num_docs = RandomInt(rng, 50, 300);
+    const std::vector<std::string> vocab =
+        MakeVocabulary(RandomInt(rng, 20, 120));
+    const int last = static_cast<int>(vocab.size()) - 1;
+
+    // Generate unique terms per document and the expected postings.
+    std::vector<std::vector<int>> doc_terms(num_docs);
+    std::map<std::string, std::vector<uint32_t>> expected;
+    for (int d = 0; d < num_docs; ++d) {
+      std::unordered_set<int> chosen;
+      const int count = RandomInt(rng, 1, 30);
+      for (int i = 0; i < count; ++i) chosen.insert(RandomInt(rng, 0, last));
+      doc_terms[d].assign(chosen.begin(), chosen.end());
+      for (int t : doc_terms[d]) {
+        expected[vocab[t]].push_back(static_cast<uint32_t>(d));
+      }
+    }
+
+    StripedHashTable table(buckets, stripes);
+    std::atomic<int> next_doc{0};
+    std::atomic<bool> writers_done{false};
+    std::atomic<int> reader_violations{0};
+
+    std::vector<std::jthread> threads;
+    for (int r = 0; r < num_readers; ++r) {
+      threads.emplace_back([&, r] {
+        std::mt19937 local(seed * 31 + static_cast<uint32_t>(r));
+        auto check_once = [&] {
+          const std::string& term = vocab[RandomInt(local, 0, last)];
+          const std::vector<uint32_t> got =
+              table.Lookup(term, StripedHashTable::Fnv1aHash64(term));
+          const auto it = expected.find(term);
+          std::unordered_set<uint32_t> seen;
+          for (uint32_t id : got) {
+            const bool known = it != expected.end() &&
+                               std::find(it->second.begin(), it->second.end(),
+                                         id) != it->second.end();
+            if (!known || !seen.insert(id).second) ++reader_violations;
+          }
+        };
+        while (!writers_done.load()) check_once();
+        check_once();
+      });
+    }
+    {
+      std::vector<std::jthread> writers;
+      for (int w = 0; w < num_writers; ++w) {
+        writers.emplace_back([&] {
+          for (;;) {
+            const int d = next_doc.fetch_add(1);
+            if (d >= num_docs) return;
+            std::map<size_t, std::vector<StripedInsertItem>> by_stripe;
+            for (int t : doc_terms[d]) {
+              const uint64_t h = StripedHashTable::Fnv1aHash64(vocab[t]);
+              by_stripe[table.StripeFor(h)].push_back(
+                  {vocab[t], h, static_cast<uint32_t>(d)});
+            }
+            for (const auto& [stripe, items] : by_stripe) {
+              table.InsertBatch(stripe, items);
+            }
+          }
+        });
+      }
+    }  // Writers joined here.
+    writers_done = true;
+    threads.clear();  // Joins readers.
+
+    Check(reader_violations.load() == 0,
+          "insert: readers saw a duplicate or unknown doc_id");
+    for (const auto& [term, ids] : expected) {
+      std::vector<uint32_t> got =
+          table.Lookup(term, StripedHashTable::Fnv1aHash64(term));
+      std::sort(got.begin(), got.end());
+      Check(got == ids, "insert: postings equal inserted doc_ids exactly once");
+    }
+    Check(table.UniqueTermCount() == expected.size(),
+          "insert: unique term count matches");
+    const std::string absent = "zzzabsent";
+    Check(table.Lookup(absent, StripedHashTable::Fnv1aHash64(absent)).empty(),
+          "insert: absent term has empty postings");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -381,6 +482,7 @@ int main() {
   CheckShutdownDrainsAndJoins();
   CheckSubmitResultAndException();
   CheckEnqueueExceptionsKeepPoolAlive();
+  CheckConcurrentInsertBatch();
   if (FailureCount() != 0) {
     Log("index_stress_test: " + std::to_string(FailureCount()) + " failure(s)");
     return 1;
