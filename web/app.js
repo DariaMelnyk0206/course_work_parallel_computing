@@ -114,7 +114,7 @@ const STATE_LABELS = {
 };
 
 // State of the current search; `socket` is null when no search is active.
-const search = { socket: null, sentAt: 0, finished: false };
+const search = { socket: null, sentAt: 0, finished: false, terms: [] };
 
 function stageElement(name) {
   return document.getElementById("stage-" + name);
@@ -153,19 +153,45 @@ function renderSummary(shown, total) {
   }
   setText(dom.resultsSummary, "Показано " + shown + " з " + total);
 }
-function renderResults(results) {
+// Appends `text` to `parent`, wrapping every token equal (case-insensitively)
+// to one of `terms` in <mark>. Tokens follow the server's ASCII rule
+// [A-Za-z0-9]+. Only createElement/createTextNode are used.
+function appendHighlighted(parent, text, terms) {
+  const wanted = new Set(terms.map((t) => String(t).toLowerCase()));
+  const pattern = /[A-Za-z0-9]+/g;
+  let last = 0;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    if (!wanted.has(match[0].toLowerCase())) {
+      continue;
+    }
+    if (match.index > last) {
+      parent.appendChild(document.createTextNode(text.slice(last, match.index)));
+    }
+    const mark = document.createElement("mark");
+    mark.appendChild(document.createTextNode(match[0]));
+    parent.appendChild(mark);
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) {
+    parent.appendChild(document.createTextNode(text.slice(last)));
+  }
+}
+
+function renderResults(results, terms) {
   dom.resultsList.replaceChildren();
   for (const result of results) {
     const item = document.createElement("li");
     const id = document.createElement("span");
     id.className = "doc-id";
-    setText(id, result.doc_id);
+    const title = typeof result.title === "string" ? result.title : "";
+    setText(id, title === "" ? result.doc_id : result.doc_id + " — " + title);
     const score = document.createElement("span");
     score.className = "score";
     setText(score, "score: " + Number(result.score).toFixed(4));
     const snippet = document.createElement("p");
     snippet.className = "snippet";
-    setText(snippet, result.snippet);
+    appendHighlighted(snippet, String(result.snippet), terms || []);
     item.append(id, score, snippet);
     dom.resultsList.appendChild(item);
   }
@@ -175,8 +201,9 @@ function resetPipeline() {
   for (const name of STAGES) {
     setStage(name, "pending");
   }
+  search.terms = [];
   renderTerms([]);
-  renderResults([]);
+  renderResults([], []);
   renderSummary(null, null);
   showError("");
 }
@@ -202,15 +229,16 @@ function handleMessage(message) {
     case "query_expansion":
       setStage("query_expansion", "done", Date.now() - search.sentAt);
       setStage("keyword_search", "running");
-      renderTerms(Array.isArray(data.expanded_terms) ? data.expanded_terms
-                                                     : []);
+      search.terms = Array.isArray(data.expanded_terms) ? data.expanded_terms
+                                                        : [];
+      renderTerms(search.terms);
       break;
     case "keyword_search":
       setStage("keyword_search", "done", data.time_ms);
       setStage("done", "running");
       {
         const results = Array.isArray(data.results) ? data.results : [];
-        renderResults(results);
+        renderResults(results, search.terms);
         const total = Number.isInteger(data.total_matches)
                           ? data.total_matches
                           : results.length;
