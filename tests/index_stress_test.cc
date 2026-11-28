@@ -474,6 +474,100 @@ void CheckConcurrentInsertBatch() {
   }
 }
 
+// Property 6: Lookup returns an independent copy (Requirements 7.7, 7.9). A
+// vector obtained from Lookup(t) stays unchanged while other threads insert
+// more postings and perform further Lookups. Mutating the returned vector
+// does not affect what later Lookups return.
+void CheckLookupReturnsIndependentCopy() {
+  using search_engine::StripedHashTable;
+  using search_engine::StripedInsertItem;
+  for (uint32_t seed : kSeeds) {
+    std::mt19937 rng = MakeRng(seed);
+    const size_t buckets = size_t{1} << RandomInt(rng, 3, 7);
+    const size_t stripes = size_t{1} << RandomInt(rng, 0, 3);
+    const int num_terms = RandomInt(rng, 3, 20);
+    const int initial_docs = RandomInt(rng, 5, 40);
+    const int extra_docs = RandomInt(rng, 50, 300);
+    const int num_writers = RandomInt(rng, 2, 6);
+    const std::vector<std::string> vocab = MakeVocabulary(num_terms);
+
+    StripedHashTable table(buckets, stripes);
+    auto insert_doc = [&](uint32_t d) {
+      for (const std::string& term : vocab) {
+        const uint64_t h = StripedHashTable::Fnv1aHash64(term);
+        table.InsertBatch(table.StripeFor(h), {{term, h, d}});
+      }
+    };
+    // Documents with ids [0, initial_docs) are present before snapshots.
+    for (int d = 0; d < initial_docs; ++d) insert_doc(static_cast<uint32_t>(d));
+
+    // Snapshots taken now, plus reference copies of their contents.
+    std::vector<std::vector<uint32_t>> snapshots;
+    std::vector<std::vector<uint32_t>> references;
+    for (const std::string& term : vocab) {
+      snapshots.push_back(
+          table.Lookup(term, StripedHashTable::Fnv1aHash64(term)));
+      references.push_back(snapshots.back());
+    }
+
+    // Writers add further documents; a reader mutates its own copies and
+    // checks that fresh Lookups never reflect those mutations.
+    std::atomic<int> next_doc{initial_docs};
+    std::atomic<bool> writers_done{false};
+    std::atomic<int> mutation_leaks{0};
+    {
+      std::vector<std::jthread> threads;
+      threads.emplace_back([&] {
+        auto probe = [&] {
+          for (const std::string& term : vocab) {
+            const uint64_t h = StripedHashTable::Fnv1aHash64(term);
+            std::vector<uint32_t> mine = table.Lookup(term, h);
+            const std::vector<uint32_t> before = mine;
+            std::fill(mine.begin(), mine.end(), 0xFFFFFFFFu);
+            mine.push_back(0xFFFFFFFFu);
+            std::vector<uint32_t> again = table.Lookup(term, h);
+            // `again` may have grown, but must never contain the sentinel.
+            if (std::find(again.begin(), again.end(), 0xFFFFFFFFu) !=
+                again.end()) {
+              ++mutation_leaks;
+            }
+            if (again.size() < before.size()) ++mutation_leaks;
+          }
+        };
+        while (!writers_done.load()) probe();
+        probe();
+      });
+      std::vector<std::jthread> writers;
+      for (int w = 0; w < num_writers; ++w) {
+        writers.emplace_back([&] {
+          for (;;) {
+            const int d = next_doc.fetch_add(1);
+            if (d >= initial_docs + extra_docs) return;
+            insert_doc(static_cast<uint32_t>(d));
+          }
+        });
+      }
+      writers.clear();  // Joins writers.
+      writers_done = true;
+    }  // Reader joined here.
+
+    Check(mutation_leaks.load() == 0,
+          "copy: mutating a returned vector leaked into the table");
+    for (size_t i = 0; i < vocab.size(); ++i) {
+      Check(snapshots[i] == references[i],
+            "copy: earlier Lookup result unchanged by later inserts");
+      const uint64_t h = StripedHashTable::Fnv1aHash64(vocab[i]);
+      std::vector<uint32_t> fresh = table.Lookup(vocab[i], h);
+      Check(fresh.size() == static_cast<size_t>(initial_docs + extra_docs),
+            "copy: fresh Lookup sees all inserted postings");
+      // Mutating a snapshot must not change the table.
+      std::fill(snapshots[i].begin(), snapshots[i].end(), 0xFFFFFFFFu);
+      Check(table.Lookup(vocab[i], h) == fresh,
+            "copy: mutating a snapshot does not change later Lookups");
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -483,6 +577,7 @@ int main() {
   CheckSubmitResultAndException();
   CheckEnqueueExceptionsKeepPoolAlive();
   CheckConcurrentInsertBatch();
+  CheckLookupReturnsIndependentCopy();
   if (FailureCount() != 0) {
     Log("index_stress_test: " + std::to_string(FailureCount()) + " failure(s)");
     return 1;
