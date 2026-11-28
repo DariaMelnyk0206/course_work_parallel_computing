@@ -8,10 +8,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include "thread_pool.h"
 
 namespace {
 
@@ -115,10 +119,80 @@ void CheckHarness() {
   }
 }
 
+// Property 1: bounded queue limit (Requirements 4.3, 4.4, 4.5). With every
+// worker blocked and C tasks queued, the next enqueue() returns false at once;
+// an unbounded pool accepts every task until shutdown().
+void CheckBoundedQueueLimit() {
+  using search_engine::ThreadPool;
+  for (uint32_t seed : kSeeds) {
+    std::mt19937 rng = MakeRng(seed);
+    const size_t workers = static_cast<size_t>(RandomInt(rng, 1, 4));
+    const size_t capacity = static_cast<size_t>(RandomInt(rng, 1, 16));
+
+    std::promise<void> gate;
+    std::shared_future<void> gate_future = gate.get_future().share();
+    std::atomic<size_t> started{0};
+    std::atomic<size_t> executed{0};
+    size_t accepted = 0;
+    {
+      ThreadPool pool(workers, capacity);
+      // Occupy every worker so that queued tasks stay queued.
+      for (size_t i = 0; i < workers; ++i) {
+        Check(pool.enqueue([&] {
+          ++started;
+          gate_future.wait();
+          ++executed;
+        }),
+              "bounded: blocker accepted");
+        ++accepted;
+      }
+      while (started.load() < workers) std::this_thread::yield();
+
+      // Fill the queue to capacity: all accepted.
+      for (size_t i = 0; i < capacity; ++i) {
+        Check(pool.enqueue([&] { ++executed; }),
+              "bounded: enqueue below capacity returns true");
+        ++accepted;
+      }
+      // Queue is full: rejected immediately, repeatedly.
+      for (int i = 0; i < 3; ++i) {
+        Check(!pool.enqueue([&] { ++executed; }),
+              "bounded: enqueue on full queue returns false");
+      }
+      gate.set_value();
+      pool.shutdown();
+      Check(!pool.enqueue([] {}), "bounded: enqueue after shutdown is false");
+    }
+    Check(executed.load() == accepted,
+          "bounded: only accepted tasks executed (rejected ones dropped)");
+
+    // Unbounded queue: always true until shutdown().
+    const size_t many = static_cast<size_t>(RandomInt(rng, 200, 1000));
+    std::promise<void> gate2;
+    std::shared_future<void> gate2_future = gate2.get_future().share();
+    std::atomic<size_t> ran{0};
+    ThreadPool unbounded(workers, 0);
+    bool all_accepted = true;
+    for (size_t i = 0; i < many; ++i) {
+      all_accepted &= unbounded.enqueue([&] {
+        gate2_future.wait();
+        ++ran;
+      });
+    }
+    Check(all_accepted, "unbounded: enqueue always returns true");
+    gate2.set_value();
+    unbounded.shutdown();
+    Check(ran.load() == many, "unbounded: all tasks executed");
+    Check(!unbounded.enqueue([] {}),
+          "unbounded: enqueue after shutdown is false");
+  }
+}
+
 }  // namespace
 
 int main() {
   CheckHarness();
+  CheckBoundedQueueLimit();
   if (FailureCount() != 0) {
     Log("index_stress_test: " + std::to_string(FailureCount()) + " failure(s)");
     return 1;
