@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -56,6 +57,7 @@ ApiServer::ApiServer(Config config, std::shared_ptr<SearchService> service)
   RegisterIndex();
   RegisterSearch();
   RegisterStats();
+  RegisterWebSocket();
   RegisterErrorHandling();
 }
 
@@ -197,7 +199,97 @@ void ApiServer::RegisterStats() {
   });
 }
 
-void ApiServer::RegisterWebSocket() {}
+namespace {
+
+// Sends one JSON message; false means the client is gone.
+bool SendJson(httplib::ws::WebSocket& ws, const nlohmann::json& message) {
+  return ws.send(DumpJson(message));
+}
+
+// Sends {"stage": "error", ...} and closes with 1008 (Requirement 19.7).
+void SendWsError(httplib::ws::WebSocket& ws, const std::string& message) {
+  SendJson(ws, {{"stage", "error"}, {"data", {{"message", message}}}});
+  ws.close(httplib::ws::CloseStatus::PolicyViolation, "policy violation");
+}
+
+// Returns the query text if `payload` is a JSON object with a non-blank
+// string "query".
+std::optional<std::string> ParseWsQuery(const std::string& payload) {
+  nlohmann::json body = nlohmann::json::parse(payload, nullptr, false);
+  if (!body.is_object()) return std::nullopt;
+  auto it = body.find("query");
+  if (it == body.end() || !it->is_string()) return std::nullopt;
+  std::string query = it->get<std::string>();
+  if (IsBlank(query)) return std::nullopt;
+  return query;
+}
+
+}  // namespace
+
+void ApiServer::RegisterWebSocket() {
+  server_.WebSocket("/ws/search", [this](const httplib::Request&,
+                                         httplib::ws::WebSocket& ws) {
+    std::string payload;
+    for (;;) {
+      const auto read_result = ws.read(payload);
+      if (read_result == httplib::ws::Fail) return;  // Closed or broken.
+      if (read_result == httplib::ws::Timeout) continue;
+      try {
+        const auto start = std::chrono::steady_clock::now();
+        // A binary frame is treated like invalid JSON.
+        std::optional<std::string> query;
+        if (read_result == httplib::ws::Text) query = ParseWsQuery(payload);
+        if (!query) {
+          SendWsError(ws, "Field 'query' must be a non-empty string");
+          return;
+        }
+
+        // The original query text goes to the LLM unchanged (PD Section 8.1).
+        const QueryExpansion expansion = service_->ExpandQuery(*query);
+        if (!SendJson(ws, {{"stage", "query_expansion"},
+                           {"data",
+                            {{"original", *query},
+                             {"expanded_terms", expansion.expanded_terms}}}})) {
+          return;
+        }
+
+        const KeywordSearchOutcome found =
+            service_->RunKeywordSearch(expansion);
+        nlohmann::json results = nlohmann::json::array();
+        for (const SearchResult& r : found.results) {
+          results.push_back({{"doc_id", r.doc_id},
+                             {"score", r.score},
+                             {"snippet", r.snippet}});
+        }
+        if (!SendJson(ws, {{"stage", "keyword_search"},
+                           {"data",
+                            {{"results", std::move(results)},
+                             {"time_ms", found.search_time_ms}}}})) {
+          return;
+        }
+
+        const int64_t total_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+        if (!SendJson(ws, {{"stage", "done"},
+                           {"data", {{"total_time_ms", total_ms}}}})) {
+          return;
+        }
+        // The connection stays open for the next query.
+      } catch (const std::exception& e) {
+        Logger::Instance().Error(std::string("WS /ws/search failed: ") +
+                                 e.what());
+        SendWsError(ws, "Internal server error");
+        return;
+      } catch (...) {
+        SendWsError(ws, "Internal server error");
+        return;
+      }
+    }
+  });
+}
+
 void ApiServer::RegisterErrorHandling() {
   // Fills a JSON body for any error without one (404, 405, 413, ...). Bodies
   // set by route handlers are left untouched.
