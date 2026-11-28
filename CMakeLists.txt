@@ -47,7 +47,7 @@ if(ENABLE_TSAN)
 endif()
 
 add_library(search_core STATIC
-  src/logger.cc)
+  src/config.cc src/logger.cc)
 target_include_directories(search_core PUBLIC src)
 target_link_libraries(search_core PUBLIC
   search_build_options httplib::httplib nlohmann_json::nlohmann_json)
