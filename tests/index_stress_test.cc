@@ -10,6 +10,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "index_builder.h"
+#include "inverted_index.h"
 #include "ranker.h"
 #include "striped_hash_table.h"
 #include "thread_pool.h"
@@ -378,8 +380,12 @@ void CheckEnqueueExceptionsKeepPoolAlive() {
   }
 }
 
-// Deterministic per-document offset used by the insert checks.
-uint32_t OffsetFor(int doc) { return static_cast<uint32_t>(doc) * 3 + 1; }
+// Deterministic offset for a (document, term) pair used by the insert checks.
+// It differs per pair, so a lost or swapped offset is detected.
+uint32_t OffsetFor(int doc, int term) {
+  return static_cast<uint32_t>(doc) * 1009 + static_cast<uint32_t>(term) * 7 +
+         1;
+}
 
 // Property 5: concurrent InsertBatch calls neither lose nor duplicate postings
 // (Requirements 7.1, 7.6, 7.8, 7.11). Several writer threads insert documents
@@ -404,14 +410,15 @@ void CheckConcurrentInsertBatch() {
 
     // Generate unique terms per document and the expected postings.
     std::vector<std::vector<int>> doc_terms(num_docs);
-    std::map<std::string, std::vector<uint32_t>> expected;
+    std::map<std::string, std::vector<Posting>> expected;
     for (int d = 0; d < num_docs; ++d) {
       std::unordered_set<int> chosen;
       const int count = RandomInt(rng, 1, 30);
       for (int i = 0; i < count; ++i) chosen.insert(RandomInt(rng, 0, last));
       doc_terms[d].assign(chosen.begin(), chosen.end());
       for (int t : doc_terms[d]) {
-        expected[vocab[t]].push_back(static_cast<uint32_t>(d));
+        expected[vocab[t]].push_back(
+            {static_cast<uint32_t>(d), OffsetFor(d, t)});
       }
     }
 
@@ -434,7 +441,7 @@ void CheckConcurrentInsertBatch() {
             const uint32_t id = posting.doc_id;
             const bool known = it != expected.end() &&
                                std::find(it->second.begin(), it->second.end(),
-                                         id) != it->second.end();
+                                         posting) != it->second.end();
             if (!known || !seen.insert(id).second) ++reader_violations;
           }
         };
@@ -453,7 +460,7 @@ void CheckConcurrentInsertBatch() {
             for (int t : doc_terms[d]) {
               const uint64_t h = StripedHashTable::Fnv1aHash64(vocab[t]);
               by_stripe[table.StripeFor(h)].push_back(
-                  {vocab[t], h, static_cast<uint32_t>(d), OffsetFor(d)});
+                  {vocab[t], h, static_cast<uint32_t>(d), OffsetFor(d, t)});
             }
             for (const auto& [stripe, items] : by_stripe) {
               table.InsertBatch(stripe, items);
@@ -467,17 +474,13 @@ void CheckConcurrentInsertBatch() {
 
     Check(reader_violations.load() == 0,
           "insert: readers saw a duplicate or unknown doc_id");
-    for (const auto& [term, ids] : expected) {
-      std::vector<Posting> postings =
+    for (auto& [term, pairs] : expected) {
+      std::vector<Posting> got =
           table.Lookup(term, StripedHashTable::Fnv1aHash64(term));
-      std::vector<uint32_t> got;
-      for (const Posting& posting : postings) {
-        Check(posting.offset == OffsetFor(static_cast<int>(posting.doc_id)),
-              "insert: posting keeps its offset");
-        got.push_back(posting.doc_id);
-      }
       std::sort(got.begin(), got.end());
-      Check(got == ids, "insert: postings equal inserted doc_ids exactly once");
+      std::sort(pairs.begin(), pairs.end());
+      Check(got == pairs,
+            "insert: postings equal inserted (doc_id, offset) pairs exactly");
     }
     Check(table.UniqueTermCount() == expected.size(),
           "insert: unique term count matches");
@@ -584,6 +587,55 @@ void CheckLookupReturnsIndependentCopy() {
   }
 }
 
+// Independent first-occurrence offset: byte position of the first whole-token
+// match of `term` in `text` (found with std::string::find, then checking that
+// both neighbours are not ASCII letters/digits), or npos.
+size_t FirstTokenOffset(const std::string& text, const std::string& term) {
+  auto is_alnum = [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z');
+  };
+  for (size_t pos = text.find(term); pos != std::string::npos;
+       pos = text.find(term, pos + 1)) {
+    const bool left_ok = pos == 0 || !is_alnum(text[pos - 1]);
+    const size_t end = pos + term.size();
+    const bool right_ok = end >= text.size() || !is_alnum(text[end]);
+    if (left_ok && right_ok) return pos;
+  }
+  return std::string::npos;
+}
+
+// For every vocabulary term, the postings in `index` must be exactly the
+// (doc_id, first-occurrence offset) pairs computed from the file texts.
+void CheckOffsetsAgainstText(const fs::path& dir,
+                             const std::vector<std::string>& vocab,
+                             const search_engine::InvertedIndex& index) {
+  using search_engine::Posting;
+  using search_engine::StripedHashTable;
+  std::map<std::string, std::vector<Posting>> expected;
+  for (uint32_t d = 0; d < index.DocumentCount(); ++d) {
+    std::ifstream in(dir / index.Documents().Get(d).name, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    for (const std::string& term : vocab) {
+      const size_t pos = FirstTokenOffset(text, term);
+      if (pos != std::string::npos) {
+        expected[term].push_back({d, static_cast<uint32_t>(pos)});
+      }
+    }
+  }
+  for (const std::string& term : vocab) {
+    std::vector<Posting> got =
+        index.Table().Lookup(term, StripedHashTable::Fnv1aHash64(term));
+    std::vector<Posting> want = expected[term];
+    std::sort(got.begin(), got.end());
+    std::sort(want.begin(), want.end());
+    Check(got == want,
+          "offsets: posting offsets equal independent first-occurrence "
+          "positions in the file text");
+  }
+}
+
 // Feature: llm-search-engine, Property 7: index content does not depend on
 // the number of indexing threads (Requirements 9.4, 28.4). A synthetic corpus
 // is built through IndexBuilder::Build with 1, 2, 4 and 8 threads; document
@@ -616,6 +668,12 @@ void CheckIndexDeterminismAcrossThreadCounts() {
               base.documents_indexed == static_cast<uint32_t>(num_docs),
           "determinism: baseline indexed every document");
     if (base.index == nullptr) continue;
+    CheckOffsetsAgainstText(dir.path(), vocab, *base.index);
+    for (size_t b = 1; b < builds.size(); ++b) {
+      if (builds[b].index != nullptr) {
+        CheckOffsetsAgainstText(dir.path(), vocab, *builds[b].index);
+      }
+    }
     for (size_t b = 1; b < builds.size(); ++b) {
       const IndexBuildResult& other = builds[b];
       if (other.index == nullptr) {
