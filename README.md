@@ -151,6 +151,7 @@ curl http://localhost:8080/api/stats
 
 Клієнт надсилає `{"query": "..."}`, сервер надсилає по одному повідомленню на етап:
 `query_expansion` → `keyword_search` → `done`. Після `done` з'єднання залишається відкритим.
+У `keyword_search` поле `total_matches` — кількість усіх знайдених документів до обрізання до `TOP_K` (у відповіді REST цього поля немає, контракт фіксований).
 У разі помилки (невалідний JSON або порожній `query`) приходить `{"stage": "error", ...}`
 і сервер закриває з'єднання.
 
@@ -176,7 +177,7 @@ asyncio.run(main())
 
 ```json
 {"data":{"expanded_terms":["ghost"],"original":"ghost"},"stage":"query_expansion"}
-{"data":{"results":[{"doc_id":"1.txt","score":1.0,"snippet":"The ghost walked the ocean voyage at night. ..."}],"time_ms":0},"stage":"keyword_search"}
+{"data":{"results":[{"doc_id":"1.txt","score":1.0,"snippet":"The ghost walked the ocean voyage at night. ..."}],"time_ms":0,"total_matches":1},"stage":"keyword_search"}
 {"data":{"total_time_ms":0},"stage":"done"}
 ```
 
