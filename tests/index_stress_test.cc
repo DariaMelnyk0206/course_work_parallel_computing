@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "index_builder.h"
+#include "ranker.h"
 #include "striped_hash_table.h"
 #include "thread_pool.h"
 
@@ -573,12 +574,14 @@ void CheckLookupReturnsIndependentCopy() {
 // the number of indexing threads (Requirements 9.4, 28.4). A synthetic corpus
 // is built through IndexBuilder::Build with 1, 2, 4 and 8 threads; document
 // count, unique term count, document names and snippets, and the sorted
-// postings of every term must be identical across all builds. Search-result
-// comparison is added with the Ranker (task 10.2).
+// postings of every term must be identical across all builds, and
+// Ranker::Rank must return identical results for a fixed set of queries.
 void CheckIndexDeterminismAcrossThreadCounts() {
   using search_engine::IndexBuilder;
   using search_engine::IndexBuildResult;
+  using search_engine::Ranker;
   using search_engine::StripedHashTable;
+  using search_engine::WeightedTerm;
   constexpr int kThreadCounts[] = {1, 2, 4, 8};
   for (uint32_t seed : kSeeds) {
     std::mt19937 rng = MakeRng(seed);
@@ -623,6 +626,33 @@ void CheckIndexDeterminismAcrossThreadCounts() {
         std::sort(a.begin(), a.end());
         std::sort(c.begin(), c.end());
         Check(a == c, "determinism: sorted postings equal across threads");
+      }
+
+      // Search results (task 10.2): fixed weighted queries must rank
+      // identically (doc_id, score, snippet, order) on both indexes.
+      std::mt19937 qrng(seed * 17 + static_cast<uint32_t>(b));
+      for (int q = 0; q < 10; ++q) {
+        std::vector<WeightedTerm> terms;
+        const int count = RandomInt(qrng, 1, 6);
+        for (int i = 0; i < count; ++i) {
+          const std::string& t =
+              vocab[RandomInt(qrng, 0, static_cast<int>(vocab.size()) - 1)];
+          terms.push_back({t, StripedHashTable::Fnv1aHash64(t),
+                           RandomInt(qrng, 0, 1) == 0 ? 2.0 : 1.0});
+        }
+        if (q % 3 == 0) {  // Term absent from the index (DF = 0).
+          const std::string absent = "zzzabsent";
+          terms.push_back({absent, StripedHashTable::Fnv1aHash64(absent), 1.0});
+        }
+        const int top_k = RandomInt(qrng, 1, 30);
+        const auto r1 = Ranker::Rank(terms, *base.index, top_k);
+        const auto r2 = Ranker::Rank(terms, *other.index, top_k);
+        bool same = r1.size() == r2.size();
+        for (size_t i = 0; same && i < r1.size(); ++i) {
+          same = r1[i].doc_id == r2[i].doc_id && r1[i].score == r2[i].score &&
+                 r1[i].snippet == r2[i].snippet;
+        }
+        Check(same, "determinism: search results equal across thread counts");
       }
     }
   }
