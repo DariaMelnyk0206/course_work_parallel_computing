@@ -11,6 +11,7 @@
 #include <future>
 #include <iostream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -225,12 +226,94 @@ void CheckShutdownDrainsAndJoins() {
   }
 }
 
+// Property 3: Submit delivers the result or the exception (Requirements 4.8,
+// 4.9). For pure functions that either return a value or throw, future.get()
+// reproduces exactly what a direct synchronous call produces.
+void CheckSubmitResultAndException() {
+  using search_engine::ThreadPool;
+  for (uint32_t seed : kSeeds) {
+    std::mt19937 rng = MakeRng(seed);
+    const size_t workers = static_cast<size_t>(RandomInt(rng, 1, 8));
+    const int n = RandomInt(rng, 20, 200);
+    ThreadPool pool(workers, 0);
+
+    // Pure function: throws std::invalid_argument for odd inputs, otherwise
+    // returns a value derived from the input.
+    auto pure = [](int x) {
+      if (x % 2 != 0) throw std::invalid_argument("odd:" + std::to_string(x));
+      return x * 3 + 1;
+    };
+
+    std::vector<int> inputs;
+    std::vector<std::future<int>> futures;
+    for (int i = 0; i < n; ++i) {
+      const int x = RandomInt(rng, -1000, 1000);
+      inputs.push_back(x);
+      futures.push_back(pool.Submit([pure, x] { return pure(x); }));
+    }
+    // Void task whose future must become ready without a value.
+    std::atomic<int> void_ran{0};
+    std::future<void> void_future = pool.Submit([&] { ++void_ran; });
+    // Task throwing a type outside the std::exception hierarchy.
+    std::future<int> odd_future = pool.Submit([]() -> int { throw 42; });
+
+    for (int i = 0; i < n; ++i) {
+      const int x = inputs[i];
+      bool expected_threw = false;
+      std::string expected_what;
+      int expected_value = 0;
+      try {
+        expected_value = pure(x);
+      } catch (const std::invalid_argument& e) {
+        expected_threw = true;
+        expected_what = e.what();
+      }
+      try {
+        const int got = futures[i].get();
+        Check(!expected_threw && got == expected_value,
+              "submit: future returns the same value as a direct call");
+      } catch (const std::invalid_argument& e) {
+        Check(expected_threw && expected_what == e.what(),
+              "submit: future rethrows the same exception as a direct call");
+      } catch (...) {
+        Check(false, "submit: unexpected exception type from future");
+      }
+    }
+
+    void_future.get();
+    Check(void_ran.load() == 1, "submit: void task ran exactly once");
+    try {
+      odd_future.get();
+      Check(false, "submit: non-std exception must propagate");
+    } catch (int v) {
+      Check(v == 42, "submit: non-std exception value preserved");
+    } catch (...) {
+      Check(false, "submit: non-std exception type preserved");
+    }
+
+    // The pool keeps working after tasks threw.
+    Check(pool.Submit([] { return 7; }).get() == 7,
+          "submit: pool usable after throwing tasks");
+
+    // Submit to a stopped pool is rejected with std::runtime_error.
+    pool.shutdown();
+    bool rejected = false;
+    try {
+      pool.Submit([] { return 1; });
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    Check(rejected, "submit: stopped pool rejects with runtime_error");
+  }
+}
+
 }  // namespace
 
 int main() {
   CheckHarness();
   CheckBoundedQueueLimit();
   CheckShutdownDrainsAndJoins();
+  CheckSubmitResultAndException();
   if (FailureCount() != 0) {
     Log("index_stress_test: " + std::to_string(FailureCount()) + " failure(s)");
     return 1;
