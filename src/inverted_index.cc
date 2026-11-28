@@ -4,7 +4,6 @@
 
 namespace search_engine {
 
-// Stubs: real implementation is added in a later task.
 InvertedIndex::InvertedIndex(StripedHashTable table, DocumentTable documents,
                              uint32_t document_count)
     : table_(std::move(table)),
