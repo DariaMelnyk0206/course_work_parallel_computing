@@ -1,0 +1,278 @@
+@startuml class_diagram
+title Class diagram (from src/*.h and cli/search_cli.h)
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+hide empty members
+
+package "httplib (external)" {
+  abstract class "httplib::TaskQueue" as TaskQueue {
+    {abstract} +enqueue(fn: function<void()>): bool
+    {abstract} +shutdown(): void
+  }
+  class "httplib::Server" as HttpServer
+}
+
+package search_engine {
+
+  struct Config {
+    +port: int = 8080
+    +dataset_dir: string
+    +web_dir: string
+    +ollama_host: string
+    +ollama_model: string
+    +llm_timeout_ms: int = 5000
+    +expansion_enabled: bool = true
+    +request_threads: int = 64
+    +request_queue: int = 128
+    +max_index_threads: int = 256
+    +top_k: int = 20
+    +{static} FromEnvironment(): Config
+  }
+
+  class Logger <<singleton>> {
+    -mutex_: mutex
+    -Logger()
+    +{static} Instance(): Logger&
+    +Info(message: string): void
+    +Warn(message: string): void
+    +Error(message: string): void
+    -WriteLine(level: const char*, message: string): void
+  }
+
+  class ThreadPool <<final>> {
+    -workers_: vector<jthread>
+    -tasks_: queue<function<void()>>
+    -mutex_: mutex
+    -cv_: condition_variable
+    -capacity_: size_t
+    -stopping_: bool
+    +ThreadPool(num_threads: size_t, capacity: size_t)
+    +~ThreadPool()
+    +enqueue(fn: function<void()>): bool
+    +shutdown(): void
+    +Submit<F>(task: F): future<R>
+    -WorkerLoop(): void
+  }
+
+  class Tokenizer {
+    +{static} Tokenize(text: string): vector<string>
+  }
+
+  class "MakeSnippet()" as Snippet <<function>> {
+    MakeSnippet(content: string): string
+  }
+
+  struct DocumentInfo {
+    +name: string
+    +snippet: string
+    +valid: bool
+  }
+
+  class DocumentTable {
+    -documents_: vector<DocumentInfo>
+    +DocumentTable(document_count: size_t)
+    +Set(doc_id: uint32_t, info: DocumentInfo): void
+    +Get(doc_id: uint32_t): const DocumentInfo&
+    +Size(): size_t
+  }
+
+  struct StripedInsertItem {
+    +term: string
+    +hash: uint64_t
+    +doc_id: uint32_t
+  }
+
+  class StripedHashTable {
+    -num_buckets_: size_t
+    -num_stripes_: size_t
+    -buckets_: vector<vector<Entry>>
+    -stripes_: vector<shared_mutex>
+    +StripedHashTable(num_buckets: size_t, num_stripes: size_t)
+    +StripeFor(hash: uint64_t): size_t
+    +InsertBatch(stripe: size_t, items: vector<StripedInsertItem>): void
+    +Lookup(term: string, hash: uint64_t): vector<uint32_t>
+    +UniqueTermCount(): size_t
+    +{static} Fnv1aHash64(term: string): uint64_t
+    -BucketFor(hash: uint64_t): size_t
+  }
+
+  class "StripedHashTable::Entry" as Entry <<struct>> {
+    +term: string
+    +postings: vector<uint32_t>
+  }
+
+  class InvertedIndex {
+    -table_: StripedHashTable
+    -documents_: DocumentTable
+    -document_count_: uint32_t
+    +InvertedIndex(table, documents, document_count)
+    +Table(): const StripedHashTable&
+    +Documents(): const DocumentTable&
+    +DocumentCount(): uint32_t
+  }
+
+  struct IndexBuildResult {
+    +index: shared_ptr<const InvertedIndex>
+    +documents_indexed: uint32_t
+    +time_ms: int64_t
+  }
+
+  class IndexBuilder {
+    +{static} Build(dataset_dir: string, num_threads: int): IndexBuildResult
+  }
+
+  struct WeightedTerm {
+    +term: string
+    +hash: uint64_t
+    +weight: double
+  }
+
+  struct SearchResult {
+    +doc_id: string
+    +score: double
+    +snippet: string
+  }
+
+  class Ranker {
+    +{static} Rank(terms: vector<WeightedTerm>, index: InvertedIndex, top_k: int): vector<SearchResult>
+  }
+
+  struct ExpansionResult {
+    +new_terms: vector<string>
+    +used_fallback: bool
+  }
+
+  class OllamaClient {
+    -host_: string
+    -model_: string
+    -timeout_: milliseconds
+    -generate_mutex_: timed_mutex
+    +OllamaClient(host, model, timeout)
+    +Expand(original_query: string, original_terms: vector<string>): ExpansionResult
+    +IsAvailable(): bool
+    +{static} BuildPrompt(original_query: string): string
+  }
+
+  struct IndexStats {
+    +documents: uint32_t
+    +index_build_time_ms: int64_t
+    +threads_used: int
+  }
+
+  enum IndexOutcome {
+    kOk
+    kAlreadyInProgress
+  }
+
+  struct QueryExpansion {
+    +original_terms: vector<string>
+    +new_terms: vector<string>
+    +expanded_terms: vector<string>
+    +weighted_terms: vector<WeightedTerm>
+    +used_fallback: bool
+  }
+
+  struct KeywordSearchOutcome {
+    +results: vector<SearchResult>
+    +search_time_ms: int64_t
+  }
+
+  class SearchService {
+    -config_: Config
+    -ollama_client_: OllamaClient
+    -index_mutex_: mutex
+    -index_: shared_ptr<const InvertedIndex>
+    -stats_: IndexStats
+    -indexing_in_progress_: atomic<bool>
+    +SearchService(config: Config)
+    +BuildIndex(num_threads: int, documents_indexed: uint32_t*, time_ms: int64_t*): IndexOutcome
+    +ExpandQuery(query: string): QueryExpansion
+    +RunKeywordSearch(expansion: QueryExpansion): KeywordSearchOutcome
+    +Stats(): IndexStats
+    +OllamaAvailable(): bool
+    -CurrentIndex(): shared_ptr<const InvertedIndex>
+    -PublishIndex(next, docs, build_time_ms, threads): void
+  }
+
+  class "SearchService::IndexingGuard" as IndexingGuard <<private>>
+
+  class ApiServer {
+    -config_: Config
+    -service_: shared_ptr<SearchService>
+    -server_: httplib::Server
+    +ApiServer(config: Config, service: shared_ptr<SearchService>)
+    +Listen(): bool
+    +Stop(): void
+    -RegisterHealth(): void
+    -RegisterIndex(): void
+    -RegisterSearch(): void
+    -RegisterStats(): void
+    -RegisterWebSocket(): void
+    -RegisterErrorHandling(): void
+  }
+
+  struct CliOptions {
+    +host: string
+    +query: string
+    +top_k: int = 20
+    +show_health: bool
+    +show_stats: bool
+    +index_threads: int
+  }
+
+  class "search_cli" as SearchCli <<functions>> {
+    +ParseArgs(argc: int, argv: char**, options: CliOptions*): int
+    +Run(options: CliOptions): int
+  }
+}
+
+' Inheritance
+TaskQueue <|-- ThreadPool
+
+' Composition / ownership
+InvertedIndex *-- StripedHashTable
+InvertedIndex *-- DocumentTable
+DocumentTable *-- "0..*" DocumentInfo
+StripedHashTable *-- "0..*" Entry
+SearchService *-- OllamaClient
+SearchService *-- Config
+SearchService *-- IndexStats
+SearchService +-- IndexingGuard
+ApiServer *-- Config
+ApiServer *-- HttpServer
+
+' Associations / aggregation
+SearchService o-- "0..1" InvertedIndex : index_ (shared_ptr<const>)
+ApiServer o-- SearchService : shared_ptr
+IndexBuildResult o-- InvertedIndex : shared_ptr<const>
+
+' Dependencies
+ApiServer ..> ThreadPool : <<create>> via\nServer::new_task_queue\n(httplib owns the pool)
+HttpServer ..> TaskQueue : owns via unique_ptr
+SearchService ..> IndexBuilder
+SearchService ..> Ranker
+SearchService ..> Tokenizer
+SearchService ..> QueryExpansion : <<create>>
+SearchService ..> KeywordSearchOutcome : <<create>>
+SearchService ..> IndexOutcome
+IndexBuilder ..> IndexBuildResult : <<create>>
+IndexBuilder ..> ThreadPool : index_pool (Submit)
+IndexBuilder ..> InvertedIndex : <<create>>
+IndexBuilder ..> Tokenizer
+IndexBuilder ..> Snippet
+IndexBuilder ..> StripedInsertItem
+IndexBuilder ..> DocumentInfo
+Ranker ..> InvertedIndex
+Ranker ..> WeightedTerm
+Ranker ..> SearchResult : <<create>>
+QueryExpansion o-- "0..*" WeightedTerm
+KeywordSearchOutcome o-- "0..*" SearchResult
+StripedHashTable ..> StripedInsertItem
+OllamaClient ..> ExpansionResult : <<create>>
+OllamaClient ..> Tokenizer
+SearchService ..> Logger
+ApiServer ..> Logger
+OllamaClient ..> Logger
+SearchCli ..> CliOptions
+
+@enduml
