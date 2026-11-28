@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "index_builder.h"
 #include "striped_hash_table.h"
 #include "thread_pool.h"
 
@@ -568,6 +569,65 @@ void CheckLookupReturnsIndependentCopy() {
   }
 }
 
+// Feature: llm-search-engine, Property 7: index content does not depend on
+// the number of indexing threads (Requirements 9.4, 28.4). A synthetic corpus
+// is built through IndexBuilder::Build with 1, 2, 4 and 8 threads; document
+// count, unique term count, document names and snippets, and the sorted
+// postings of every term must be identical across all builds. Search-result
+// comparison is added with the Ranker (task 10.2).
+void CheckIndexDeterminismAcrossThreadCounts() {
+  using search_engine::IndexBuilder;
+  using search_engine::IndexBuildResult;
+  using search_engine::StripedHashTable;
+  constexpr int kThreadCounts[] = {1, 2, 4, 8};
+  for (uint32_t seed : kSeeds) {
+    std::mt19937 rng = MakeRng(seed);
+    TempDir dir("determinism");
+    const std::vector<std::string> vocab =
+        MakeVocabulary(RandomInt(rng, 20, 150));
+    const int num_docs = RandomInt(rng, 20, 120);
+    WriteSyntheticCorpus(dir.path(), rng, num_docs, 80, vocab);
+
+    std::vector<IndexBuildResult> builds;
+    for (int threads : kThreadCounts) {
+      builds.push_back(IndexBuilder::Build(dir.path().string(), threads));
+    }
+
+    const IndexBuildResult& base = builds[0];
+    Check(base.index != nullptr &&
+              base.documents_indexed == static_cast<uint32_t>(num_docs),
+          "determinism: baseline indexed every document");
+    if (base.index == nullptr) continue;
+    for (size_t b = 1; b < builds.size(); ++b) {
+      const IndexBuildResult& other = builds[b];
+      if (other.index == nullptr) {
+        Check(false, "determinism: build returned no index");
+        continue;
+      }
+      Check(other.documents_indexed == base.documents_indexed &&
+                other.index->DocumentCount() == base.index->DocumentCount(),
+            "determinism: document count equal across thread counts");
+      Check(other.index->Table().UniqueTermCount() ==
+                base.index->Table().UniqueTermCount(),
+            "determinism: unique term count equal across thread counts");
+      for (uint32_t d = 0; d < base.index->DocumentCount(); ++d) {
+        const auto& x = base.index->Documents().Get(d);
+        const auto& y = other.index->Documents().Get(d);
+        Check(x.name == y.name && x.snippet == y.snippet && x.valid == y.valid,
+              "determinism: document metadata equal across thread counts");
+      }
+      for (const std::string& term : vocab) {
+        const uint64_t h = StripedHashTable::Fnv1aHash64(term);
+        std::vector<uint32_t> a = base.index->Table().Lookup(term, h);
+        std::vector<uint32_t> c = other.index->Table().Lookup(term, h);
+        std::sort(a.begin(), a.end());
+        std::sort(c.begin(), c.end());
+        Check(a == c, "determinism: sorted postings equal across threads");
+      }
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -578,6 +638,7 @@ int main() {
   CheckEnqueueExceptionsKeepPoolAlive();
   CheckConcurrentInsertBatch();
   CheckLookupReturnsIndependentCopy();
+  CheckIndexDeterminismAcrossThreadCounts();
   if (FailureCount() != 0) {
     Log("index_stress_test: " + std::to_string(FailureCount()) + " failure(s)");
     return 1;
