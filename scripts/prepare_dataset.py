@@ -17,6 +17,7 @@ import urllib.request
 BUCKET = "deepmind-gutenberg"
 LIST_URL = "https://storage.googleapis.com/storage/v1/b/%s/o" % BUCKET
 FILE_URL = "https://storage.googleapis.com/%s/train/%%d.txt" % BUCKET
+METADATA_URL = "https://storage.googleapis.com/%s/metadata.csv" % BUCKET
 NAME_RE = re.compile(r"^train/(\d+)\.txt$")
 MIN_ID = 10
 MAX_ID = 30000
@@ -86,6 +87,49 @@ def download(file_id, size, out_dir):
     raise last_err
 
 
+def download_metadata(out_dir):
+    """Downloads metadata.csv into out_dir. Returns 'downloaded' or 'skipped'
+    or raises on failure."""
+    path = os.path.join(out_dir, "metadata.csv")
+    last_err = None
+    expected = None
+    for attempt in range(RETRIES):
+        try:
+            req = urllib.request.Request(METADATA_URL, method="HEAD")
+            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+                expected = int(resp.headers["Content-Length"])
+            break
+        except (urllib.error.URLError, OSError, TypeError, ValueError) as e:
+            last_err = e
+            time.sleep(1 + attempt)
+    if expected is None:
+        raise last_err
+    if os.path.isfile(path) and os.path.getsize(path) == expected:
+        return "skipped"
+    part = path + ".part"
+    for attempt in range(RETRIES):
+        try:
+            written = 0
+            with http_open(METADATA_URL) as resp, open(part, "wb") as f:
+                while True:
+                    chunk = resp.read(CHUNK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    written += len(chunk)
+            if written != expected:
+                raise OSError("size mismatch: got %d, expected %d" %
+                              (written, expected))
+            os.replace(part, path)
+            return "downloaded"
+        except (urllib.error.URLError, OSError) as e:
+            last_err = e
+            time.sleep(1 + attempt)
+    if os.path.exists(part):
+        os.remove(part)
+    raise last_err
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="./dataset", help="output directory")
@@ -123,6 +167,13 @@ def main():
                 print("Error on %d.txt: %s" % (futures[fut], e), file=sys.stderr)
             if done % 100 == 0 or done == len(files):
                 print("Progress: %d/%d" % (done, len(files)), flush=True)
+
+    try:
+        counts[download_metadata(args.out)] += 1
+        print("metadata.csv: ok")
+    except Exception as e:  # noqa: BLE001
+        counts["errors"] += 1
+        print("Error on metadata.csv: %s" % e, file=sys.stderr)
 
     print("Summary: downloaded=%d skipped=%d errors=%d" %
           (counts["downloaded"], counts["skipped"], counts["errors"]))
