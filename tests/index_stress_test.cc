@@ -22,6 +22,7 @@
 #include "index_builder.h"
 #include "inverted_index.h"
 #include "ranker.h"
+#include "search_service.h"
 #include "striped_hash_table.h"
 #include "thread_pool.h"
 
@@ -733,6 +734,171 @@ void CheckIndexDeterminismAcrossThreadCounts() {
   }
 }
 
+// Collapses whitespace runs into one space and trims both ends (independent
+// reimplementation used to locate a snippet body inside the file text).
+std::string CollapseWhitespace(const std::string& text) {
+  std::string out;
+  bool pending = false;
+  for (char c : text) {
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      pending = !out.empty();
+    } else {
+      if (pending) out.push_back(' ');
+      pending = false;
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+// Feature: llm-search-engine, Property 8: a KWIC snippet contains the anchor
+// term, fits into 160 bytes and has "..." exactly on truncated edges; a
+// corrupted anchor offset or a missing file gives the static snippet
+// (Requirements 12.6, 12.8, 12.9, 12.10, 28.9, 28.10). Also checks that
+// Rank + AttachSnippets give identical results for 1, 2, 4 and 8 build
+// threads, including anchors (Property 7, Requirement 28.4).
+void CheckKwicSnippetsAndFallback() {
+  using search_engine::IndexBuilder;
+  using search_engine::IndexBuildResult;
+  using search_engine::RankedDocument;
+  using search_engine::Ranker;
+  using search_engine::SearchResult;
+  using search_engine::SearchService;
+  using search_engine::StripedHashTable;
+  using search_engine::WeightedTerm;
+  constexpr int kThreadCounts[] = {1, 2, 4, 8};
+  const std::string kDots = "...";
+  for (uint32_t seed : kSeeds) {
+    std::mt19937 rng = MakeRng(seed);
+    TempDir dir("kwic");
+    const std::vector<std::string> vocab =
+        MakeVocabulary(RandomInt(rng, 20, 80));
+    const int num_docs = RandomInt(rng, 10, 40);
+    WriteSyntheticCorpus(dir.path(), rng, num_docs, 80, vocab);
+    const std::string dataset = dir.path().string();
+
+    std::vector<WeightedTerm> terms;
+    const int count = RandomInt(rng, 1, 4);
+    for (int i = 0; i < count; ++i) {
+      const std::string& t =
+          i == 0 ? vocab[0]
+                 : vocab[RandomInt(rng, 0, static_cast<int>(vocab.size()) - 1)];
+      if (std::any_of(terms.begin(), terms.end(),
+                      [&](const WeightedTerm& w) { return w.term == t; })) {
+        continue;
+      }
+      terms.push_back({t, StripedHashTable::Fnv1aHash64(t),
+                       RandomInt(rng, 0, 1) == 0 ? 2.0 : 1.0});
+    }
+
+    std::vector<IndexBuildResult> builds;
+    std::vector<std::vector<RankedDocument>> ranked;
+    std::vector<std::vector<SearchResult>> attached;
+    for (int threads : kThreadCounts) {
+      builds.push_back(IndexBuilder::Build(dataset, threads));
+      const IndexBuildResult& build = builds.back();
+      if (build.index == nullptr) {
+        Check(false, "kwic: build returned no index");
+        ranked.emplace_back();
+        attached.emplace_back();
+        continue;
+      }
+      ranked.push_back(Ranker::Rank(terms, *build.index, 10));
+      attached.push_back(
+          SearchService::AttachSnippets(dataset, *build.index, ranked.back()));
+    }
+    if (builds[0].index == nullptr) continue;
+    const search_engine::InvertedIndex& index = *builds[0].index;
+    const std::vector<RankedDocument>& base = ranked[0];
+    const std::vector<SearchResult>& base_results = attached[0];
+    Check(!base.empty() && base.size() == base_results.size(),
+          "kwic: query has results, one snippet per ranked document");
+    if (base.empty() || base.size() != base_results.size()) continue;
+
+    // Property 7 part: ranking, anchors and snippets equal for all threads.
+    for (size_t b = 1; b < builds.size(); ++b) {
+      bool same = ranked[b].size() == base.size() &&
+                  attached[b].size() == base_results.size();
+      for (size_t i = 0; same && i < base.size(); ++i) {
+        same = ranked[b][i].doc_index == base[i].doc_index &&
+               ranked[b][i].score == base[i].score &&
+               ranked[b][i].anchor_offset == base[i].anchor_offset &&
+               ranked[b][i].anchor_term == base[i].anchor_term &&
+               attached[b][i].doc_id == base_results[i].doc_id &&
+               attached[b][i].snippet == base_results[i].snippet;
+      }
+      Check(same, "kwic: ranking, anchors and snippets equal across threads");
+    }
+
+    // Property 8, valid anchors: every result (including the first).
+    for (size_t i = 0; i < base.size(); ++i) {
+      const auto& info = index.Documents().Get(base[i].doc_index);
+      std::ifstream in(dir.path() / info.relative_path, std::ios::binary);
+      const std::string text((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+      const std::string normalized = CollapseWhitespace(text);
+
+      std::string body = base_results[i].snippet;
+      Check(body.size() <= 160, "kwic: snippet longer than 160 bytes");
+      const bool left = body.compare(0, 3, kDots) == 0;
+      if (left) body.erase(0, 3);
+      const bool right =
+          body.size() >= 3 && body.compare(body.size() - 3, 3, kDots) == 0;
+      if (right) body.erase(body.size() - 3);
+
+      Check(FirstTokenOffset(body, base[i].anchor_term) != std::string::npos,
+            "kwic: snippet contains the anchor term");
+      const size_t pos = normalized.find(body);
+      Check(pos != std::string::npos && !body.empty(),
+            "kwic: snippet body is a contiguous part of the file text");
+      if (pos != std::string::npos) {
+        Check(left == (pos > 0), "kwic: leading ... only on a cut left edge");
+        Check(right == (pos + body.size() < normalized.size()),
+              "kwic: trailing ... only on a cut right edge");
+      }
+    }
+
+    // Property 8, corrupted anchors: the static snippet is returned.
+    auto corrupt_and_check = [&](const char* what, auto make_offset) {
+      std::vector<RankedDocument> broken = base;
+      for (RankedDocument& doc : broken) {
+        const auto& info = index.Documents().Get(doc.doc_index);
+        doc.anchor_offset =
+            make_offset(doc, fs::file_size(dir.path() / info.relative_path));
+      }
+      const auto results =
+          SearchService::AttachSnippets(dataset, index, broken);
+      bool all_static = results.size() == broken.size();
+      for (size_t i = 0; all_static && i < results.size(); ++i) {
+        all_static = results[i].snippet ==
+                     index.Documents().Get(broken[i].doc_index).snippet;
+      }
+      Check(all_static, std::string("kwic: static snippet for ") + what);
+    };
+    corrupt_and_check(
+        "offset inside a token",
+        [](const RankedDocument& d, uintmax_t) { return d.anchor_offset + 1; });
+    corrupt_and_check("offset past end of file",
+                      [](const RankedDocument&, uintmax_t size) {
+                        return static_cast<uint32_t>(size + 1000);
+                      });
+    corrupt_and_check(
+        "offset 0xFFFFFFFF",
+        [](const RankedDocument&, uintmax_t) { return 0xFFFFFFFFu; });
+
+    // Property 8, missing file: only that document falls back.
+    const auto& gone = index.Documents().Get(base[0].doc_index);
+    fs::remove(dir.path() / gone.relative_path);
+    const auto after = SearchService::AttachSnippets(dataset, index, base);
+    Check(after.size() == base.size() && after[0].snippet == gone.snippet,
+          "kwic: static snippet for a deleted file");
+    for (size_t i = 1; i < base.size() && i < after.size(); ++i) {
+      Check(after[i].snippet == base_results[i].snippet,
+            "kwic: other documents keep their KWIC snippet");
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -744,6 +910,7 @@ int main() {
   CheckConcurrentInsertBatch();
   CheckLookupReturnsIndependentCopy();
   CheckIndexDeterminismAcrossThreadCounts();
+  CheckKwicSnippetsAndFallback();
   if (FailureCount() != 0) {
     Log("index_stress_test: " + std::to_string(FailureCount()) + " failure(s)");
     return 1;
