@@ -378,6 +378,9 @@ void CheckEnqueueExceptionsKeepPoolAlive() {
   }
 }
 
+// Deterministic per-document offset used by the insert checks.
+uint32_t OffsetFor(int doc) { return static_cast<uint32_t>(doc) * 3 + 1; }
+
 // Property 5: concurrent InsertBatch calls neither lose nor duplicate postings
 // (Requirements 7.1, 7.6, 7.8, 7.11). Several writer threads insert documents
 // (each with a set of unique terms) while reader threads call Lookup. A small
@@ -385,6 +388,7 @@ void CheckEnqueueExceptionsKeepPoolAlive() {
 // writers finish, Lookup(t) must hold exactly the doc_ids that inserted t,
 // each once; readers must never see a duplicate or an unknown doc_id.
 void CheckConcurrentInsertBatch() {
+  using search_engine::Posting;
   using search_engine::StripedHashTable;
   using search_engine::StripedInsertItem;
   for (uint32_t seed : kSeeds) {
@@ -422,11 +426,12 @@ void CheckConcurrentInsertBatch() {
         std::mt19937 local(seed * 31 + static_cast<uint32_t>(r));
         auto check_once = [&] {
           const std::string& term = vocab[RandomInt(local, 0, last)];
-          const std::vector<uint32_t> got =
+          const std::vector<Posting> got =
               table.Lookup(term, StripedHashTable::Fnv1aHash64(term));
           const auto it = expected.find(term);
           std::unordered_set<uint32_t> seen;
-          for (uint32_t id : got) {
+          for (const Posting& posting : got) {
+            const uint32_t id = posting.doc_id;
             const bool known = it != expected.end() &&
                                std::find(it->second.begin(), it->second.end(),
                                          id) != it->second.end();
@@ -448,7 +453,7 @@ void CheckConcurrentInsertBatch() {
             for (int t : doc_terms[d]) {
               const uint64_t h = StripedHashTable::Fnv1aHash64(vocab[t]);
               by_stripe[table.StripeFor(h)].push_back(
-                  {vocab[t], h, static_cast<uint32_t>(d)});
+                  {vocab[t], h, static_cast<uint32_t>(d), OffsetFor(d)});
             }
             for (const auto& [stripe, items] : by_stripe) {
               table.InsertBatch(stripe, items);
@@ -463,8 +468,14 @@ void CheckConcurrentInsertBatch() {
     Check(reader_violations.load() == 0,
           "insert: readers saw a duplicate or unknown doc_id");
     for (const auto& [term, ids] : expected) {
-      std::vector<uint32_t> got =
+      std::vector<Posting> postings =
           table.Lookup(term, StripedHashTable::Fnv1aHash64(term));
+      std::vector<uint32_t> got;
+      for (const Posting& posting : postings) {
+        Check(posting.offset == OffsetFor(static_cast<int>(posting.doc_id)),
+              "insert: posting keeps its offset");
+        got.push_back(posting.doc_id);
+      }
       std::sort(got.begin(), got.end());
       Check(got == ids, "insert: postings equal inserted doc_ids exactly once");
     }
@@ -481,6 +492,7 @@ void CheckConcurrentInsertBatch() {
 // more postings and perform further Lookups. Mutating the returned vector
 // does not affect what later Lookups return.
 void CheckLookupReturnsIndependentCopy() {
+  using search_engine::Posting;
   using search_engine::StripedHashTable;
   using search_engine::StripedInsertItem;
   for (uint32_t seed : kSeeds) {
@@ -497,15 +509,15 @@ void CheckLookupReturnsIndependentCopy() {
     auto insert_doc = [&](uint32_t d) {
       for (const std::string& term : vocab) {
         const uint64_t h = StripedHashTable::Fnv1aHash64(term);
-        table.InsertBatch(table.StripeFor(h), {{term, h, d}});
+        table.InsertBatch(table.StripeFor(h), {{term, h, d, d}});
       }
     };
     // Documents with ids [0, initial_docs) are present before snapshots.
     for (int d = 0; d < initial_docs; ++d) insert_doc(static_cast<uint32_t>(d));
 
     // Snapshots taken now, plus reference copies of their contents.
-    std::vector<std::vector<uint32_t>> snapshots;
-    std::vector<std::vector<uint32_t>> references;
+    std::vector<std::vector<Posting>> snapshots;
+    std::vector<std::vector<Posting>> references;
     for (const std::string& term : vocab) {
       snapshots.push_back(
           table.Lookup(term, StripedHashTable::Fnv1aHash64(term)));
@@ -523,13 +535,14 @@ void CheckLookupReturnsIndependentCopy() {
         auto probe = [&] {
           for (const std::string& term : vocab) {
             const uint64_t h = StripedHashTable::Fnv1aHash64(term);
-            std::vector<uint32_t> mine = table.Lookup(term, h);
-            const std::vector<uint32_t> before = mine;
-            std::fill(mine.begin(), mine.end(), 0xFFFFFFFFu);
-            mine.push_back(0xFFFFFFFFu);
-            std::vector<uint32_t> again = table.Lookup(term, h);
+            std::vector<Posting> mine = table.Lookup(term, h);
+            const std::vector<Posting> before = mine;
+            const Posting sentinel{0xFFFFFFFFu, 0xFFFFFFFFu};
+            std::fill(mine.begin(), mine.end(), sentinel);
+            mine.push_back(sentinel);
+            std::vector<Posting> again = table.Lookup(term, h);
             // `again` may have grown, but must never contain the sentinel.
-            if (std::find(again.begin(), again.end(), 0xFFFFFFFFu) !=
+            if (std::find(again.begin(), again.end(), sentinel) !=
                 again.end()) {
               ++mutation_leaks;
             }
@@ -559,11 +572,12 @@ void CheckLookupReturnsIndependentCopy() {
       Check(snapshots[i] == references[i],
             "copy: earlier Lookup result unchanged by later inserts");
       const uint64_t h = StripedHashTable::Fnv1aHash64(vocab[i]);
-      std::vector<uint32_t> fresh = table.Lookup(vocab[i], h);
+      std::vector<Posting> fresh = table.Lookup(vocab[i], h);
       Check(fresh.size() == static_cast<size_t>(initial_docs + extra_docs),
             "copy: fresh Lookup sees all inserted postings");
       // Mutating a snapshot must not change the table.
-      std::fill(snapshots[i].begin(), snapshots[i].end(), 0xFFFFFFFFu);
+      std::fill(snapshots[i].begin(), snapshots[i].end(),
+                Posting{0xFFFFFFFFu, 0xFFFFFFFFu});
       Check(table.Lookup(vocab[i], h) == fresh,
             "copy: mutating a snapshot does not change later Lookups");
     }
@@ -579,6 +593,7 @@ void CheckLookupReturnsIndependentCopy() {
 void CheckIndexDeterminismAcrossThreadCounts() {
   using search_engine::IndexBuilder;
   using search_engine::IndexBuildResult;
+  using search_engine::Posting;
   using search_engine::Ranker;
   using search_engine::StripedHashTable;
   using search_engine::WeightedTerm;
@@ -621,8 +636,8 @@ void CheckIndexDeterminismAcrossThreadCounts() {
       }
       for (const std::string& term : vocab) {
         const uint64_t h = StripedHashTable::Fnv1aHash64(term);
-        std::vector<uint32_t> a = base.index->Table().Lookup(term, h);
-        std::vector<uint32_t> c = other.index->Table().Lookup(term, h);
+        std::vector<Posting> a = base.index->Table().Lookup(term, h);
+        std::vector<Posting> c = other.index->Table().Lookup(term, h);
         std::sort(a.begin(), a.end());
         std::sort(c.begin(), c.end());
         Check(a == c, "determinism: sorted postings equal across threads");

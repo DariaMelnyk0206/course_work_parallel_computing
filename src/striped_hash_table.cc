@@ -58,17 +58,18 @@ void StripedHashTable::InsertBatch(
     auto it = std::find_if(bucket.begin(), bucket.end(),
                            [&](const Entry& e) { return e.term == item.term; });
     if (it == bucket.end()) {
-      bucket.push_back(Entry{item.term, {item.doc_id}});
-    } else if (it->postings.empty() || it->postings.back() != item.doc_id) {
+      bucket.push_back(Entry{item.term, {Posting{item.doc_id, item.offset}}});
+    } else if (it->postings.empty() ||
+               it->postings.back().doc_id != item.doc_id) {
       // A doc_id is added at most once per term by the caller (Requirement
       // 7.11); the back() check cheaply guards immediate repeats.
-      it->postings.push_back(item.doc_id);
+      it->postings.push_back(Posting{item.doc_id, item.offset});
     }
   }
 }
 
-std::vector<uint32_t> StripedHashTable::Lookup(const std::string& term,
-                                               uint64_t hash) const {
+std::vector<Posting> StripedHashTable::Lookup(const std::string& term,
+                                              uint64_t hash) const {
   std::shared_lock<std::shared_mutex> lock(stripes_[StripeFor(hash)]);
   const std::vector<Entry>& bucket = buckets_[BucketFor(hash)];
   for (const Entry& entry : bucket) {

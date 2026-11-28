@@ -9,7 +9,6 @@
 #include <iterator>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -88,18 +87,16 @@ void IndexOneFile(const fs::path& path, uint32_t doc_id,
   info.valid = true;
 
   // Local aggregation, no locks (Requirement 9.4).
-  std::vector<std::string> tokens = Tokenizer::Tokenize(content);
-  std::unordered_set<std::string> unique_terms(
-      std::make_move_iterator(tokens.begin()),
-      std::make_move_iterator(tokens.end()));
-  tokens.clear();
-  tokens.shrink_to_fit();
-
+  // term -> byte offset of its first occurrence; try_emplace keeps the first.
+  std::unordered_map<std::string, uint32_t> first_offsets;
+  for (TokenOffset& token : Tokenizer::TokenizeWithOffsets(content)) {
+    first_offsets.try_emplace(std::move(token.token), token.offset);
+  }
   // Group by stripe so each stripe is locked once per document.
   std::unordered_map<size_t, std::vector<StripedInsertItem>> by_stripe;
-  for (const std::string& term : unique_terms) {
+  for (const auto& [term, offset] : first_offsets) {
     const uint64_t hash = StripedHashTable::Fnv1aHash64(term);
-    by_stripe[table->StripeFor(hash)].push_back({term, hash, doc_id});
+    by_stripe[table->StripeFor(hash)].push_back({term, hash, doc_id, offset});
   }
   for (const auto& [stripe, items] : by_stripe) {
     table->InsertBatch(stripe, items);

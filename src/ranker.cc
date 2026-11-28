@@ -31,11 +31,11 @@ std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
   // Terms with DF > 0 and their precomputed weight * IDF. Duplicate terms are
   // counted once (Q is a set); the first occurrence wins.
   std::vector<double> term_weights;
-  std::vector<std::vector<uint32_t>> postings;
+  std::vector<std::vector<Posting>> postings;
   std::unordered_set<std::string> seen;
   for (const WeightedTerm& term : terms) {
     if (!seen.insert(term.term).second) continue;
-    std::vector<uint32_t> list = index.Table().Lookup(term.term, term.hash);
+    std::vector<Posting> list = index.Table().Lookup(term.term, term.hash);
     if (list.empty()) continue;  // DF = 0: excluded everywhere.
     const double idf =
         std::log(1.0 + document_count / static_cast<double>(list.size()));
@@ -51,7 +51,9 @@ std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
 
   std::unordered_map<uint32_t, double> numerators;
   for (size_t i = 0; i < postings.size(); ++i) {
-    for (uint32_t doc_id : postings[i]) numerators[doc_id] += term_weights[i];
+    for (const Posting& posting : postings[i]) {
+      numerators[posting.doc_id] += term_weights[i];
+    }
   }
 
   if (total_matches != nullptr) *total_matches = numerators.size();

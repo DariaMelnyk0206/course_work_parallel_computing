@@ -9,6 +9,16 @@
 
 namespace search_engine {
 
+// One posting: the document and the byte offset of the term's first
+// occurrence in the source file (files over 4 GB are not supported).
+struct Posting {
+  uint32_t doc_id;
+  uint32_t offset;
+
+  friend bool operator==(const Posting&, const Posting&) = default;
+  friend auto operator<=>(const Posting&, const Posting&) = default;
+};
+
 // A single term's postings, grouped by the stripe its bucket falls into.
 // Produced by the caller before calling InsertBatch so that all terms
 // landing in one stripe are inserted under a single lock acquisition
@@ -17,9 +27,10 @@ struct StripedInsertItem {
   std::string term;
   uint64_t hash;
   uint32_t doc_id;
+  uint32_t offset;
 };
 
-// Own striped hash table mapping term -> sorted-on-read list of doc_id.
+// Own striped hash table mapping term -> list of Posting {doc_id, offset}.
 // Fixed bucket count (power of two, default 2^21), no rehashing
 // (Requirement 7.3). Separate chaining: each bucket is
 // std::vector<Entry>. A fixed array of std::shared_mutex (power of two,
@@ -29,7 +40,7 @@ class StripedHashTable {
  public:
   struct Entry {
     std::string term;
-    std::vector<uint32_t> postings;
+    std::vector<Posting> postings;
   };
 
   explicit StripedHashTable(size_t num_buckets = (1u << 21),
@@ -49,7 +60,7 @@ class StripedHashTable {
   // Returns a copy of the postings list for `term`/`hash`, taken under a
   // std::shared_lock so concurrent readers proceed in parallel
   // (Requirement 7.7, 7.9). Returns an empty vector if the term is absent.
-  std::vector<uint32_t> Lookup(const std::string& term, uint64_t hash) const;
+  std::vector<Posting> Lookup(const std::string& term, uint64_t hash) const;
 
   // Number of distinct terms currently stored (Requirement 7.12). Not a
   // running counter: IndexBuilder calls it once after all tasks have
