@@ -81,14 +81,19 @@ def post_index(host, threads):
         conn.close()
 
 
-def summarize(runs):
-    """runs: {threads: [time_ms,...]} -> rows with mean/min/max/S/E."""
+def summarize(runs, peaks=None):
+    """runs: {threads: [time_ms,...]} -> rows with mean/min/max/S/E.
+    peaks: {threads: [peak_rss_mb or None,...]} (optional)."""
     rows = []
     t1 = statistics.mean(runs[1]) if 1 in runs else None
     for n in sorted(runs):
         mean = statistics.mean(runs[n])
         row = {"threads": n, "mean_ms": mean, "min_ms": min(runs[n]),
-               "max_ms": max(runs[n]), "speedup": None, "efficiency": None}
+               "max_ms": max(runs[n]), "speedup": None, "efficiency": None,
+               "peak_rss_mb": None}
+        known = [v for v in (peaks or {}).get(n, []) if v is not None]
+        if known:
+            row["peak_rss_mb"] = statistics.mean(known)
         if t1 is not None and mean > 0:
             row["speedup"] = t1 / mean
             row["efficiency"] = row["speedup"] / n
@@ -100,24 +105,27 @@ def fmt(value, digits):
     return "" if value is None else ("%.*f" % (digits, value))
 
 
-def write_csvs(out_dir, suffix, runs, rows):
+def write_csvs(out_dir, suffix, runs, rows, peaks=None):
+    peaks = peaks or {}
     runs_path = os.path.join(out_dir, with_suffix("index_runs.csv", suffix))
     with open(runs_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["threads", "run", "time_ms"])
+        w.writerow(["threads", "run", "time_ms", "peak_rss_mb"])
         for n in sorted(runs):
             for i, t in enumerate(runs[n], 1):
-                w.writerow([n, i, t])
+                pk = peaks.get(n, [])
+                w.writerow([n, i, t,
+                            fmt(pk[i - 1], 1) if i <= len(pk) else ""])
     summary_path = os.path.join(out_dir,
                                 with_suffix("index_summary.csv", suffix))
     with open(summary_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["threads", "mean_ms", "min_ms", "max_ms", "speedup",
-                    "efficiency"])
+                    "efficiency", "peak_rss_mb"])
         for r in rows:
             w.writerow([r["threads"], fmt(r["mean_ms"], 2), r["min_ms"],
                         r["max_ms"], fmt(r["speedup"], 4),
-                        fmt(r["efficiency"], 4)])
+                        fmt(r["efficiency"], 4), fmt(r["peak_rss_mb"], 1)])
     return runs_path, summary_path
 
 
@@ -173,32 +181,112 @@ def plot_index(out_dir, suffix, rows):
     return path
 
 
+def read_vmhwm_mb(pid):
+    """Peak resident set size (VmHWM) of a process in MB; None when it is
+    unavailable (non-Linux OS, process gone)."""
+    try:
+        with open("/proc/%d/status" % pid) as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def spawn_server(args, expansion):
+    """Starts args.server_bin with the throughput spawn mechanism."""
+    port = urllib.parse.urlparse(args.host).port or 80
+    env = dict(os.environ)
+    env.update({"PORT": str(port), "EXPANSION": expansion})
+    for key, value in (("DATASET_DIR", args.dataset),
+                       ("WEB_DIR", args.web_dir),
+                       ("OLLAMA_HOST", args.ollama_host)):
+        if value:
+            env[key] = value
+    log = tempfile.TemporaryFile()
+    print("spawning %s (EXPANSION=%s)" % (args.server_bin, expansion),
+          flush=True)
+    proc = subprocess.Popen([args.server_bin], env=env, stdout=log,
+                            stderr=log)
+    return proc, log
+
+
+def stop_server(proc, log):
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    if log is not None:
+        log.close()
+
+
+def save_index_results(args, runs, peaks):
+    rows = summarize(runs, peaks)
+    paths = write_csvs(args.out, args.suffix, runs, rows, peaks)
+    return rows, paths
+
+
 def cmd_index(args):
     os.makedirs(args.out, exist_ok=True)
-    runs = {}
+    spawn = args.server == "spawn"
+    runs, peaks = {}, {}
+    failure = None
     for n in args.threads:
-        for _ in range(args.warmup):
-            t = post_index(args.host, n)
-            print("threads=%-3d warmup  %d ms (discarded)" % (n, t),
-                  flush=True)
-        runs[n] = []
-        for i in range(1, args.runs + 1):
-            t = post_index(args.host, n)
-            runs[n].append(t)
-            print("threads=%-3d run %d   %d ms" % (n, i, t), flush=True)
-    rows = summarize(runs)
-    runs_path, summary_path = write_csvs(args.out, args.suffix, runs, rows)
+        proc = log = None
+        try:
+            if spawn:
+                proc, log = spawn_server(args, "off")
+                wait_health(args.host, proc)
+            runs[n], peaks[n] = [], []
+            for _ in range(args.warmup):
+                t = post_index(args.host, n)
+                print("threads=%-3d warmup  %d ms (discarded)" % (n, t),
+                      flush=True)
+            for i in range(1, args.runs + 1):
+                t = post_index(args.host, n)
+                pk = read_vmhwm_mb(proc.pid) if spawn else None
+                runs[n].append(t)
+                peaks[n].append(pk)
+                print("threads=%-3d run %d   %d ms   peak_rss=%s MB" %
+                      (n, i, t, fmt(pk, 1) or "n/a"), flush=True)
+        except (OSError, RuntimeError, http.client.HTTPException) as e:
+            died = proc is not None and proc.poll() is not None
+            failure = "threads=%d: %s%s" % (
+                n, e, " (server exited with code %d)" % proc.returncode
+                if died else "")
+            if not runs.get(n):
+                runs.pop(n, None)
+                peaks.pop(n, None)
+            break
+        finally:
+            stop_server(proc, log)
+        # Incremental save: measured values survive a later failure.
+        save_index_results(args, runs, peaks)
+    if not runs:
+        print("error: %s" % (failure or "nothing measured"), file=sys.stderr)
+        return 1
+    rows, (runs_path, summary_path) = save_index_results(args, runs, peaks)
     png_path = plot_index(args.out, args.suffix, rows)
-    print("\nthreads  mean_ms   min_ms   max_ms  speedup  efficiency")
+    print("\nthreads  mean_ms   min_ms   max_ms  speedup  efficiency  "
+          "peak_rss_mb")
     for r in rows:
-        print("%7d %8.1f %8d %8d %8s %11s" %
+        print("%7d %8.1f %8d %8d %8s %11s %12s" %
               (r["threads"], r["mean_ms"], r["min_ms"], r["max_ms"],
-               fmt(r["speedup"], 2), fmt(r["efficiency"], 3)))
+               fmt(r["speedup"], 2), fmt(r["efficiency"], 3),
+               fmt(r["peak_rss_mb"], 1)))
     if 1 not in runs:
         print("warning: N=1 not in the thread list; speedup/efficiency "
               "are empty", file=sys.stderr)
     print("\nwrote %s\n      %s\n      %s" %
           (runs_path, summary_path, png_path))
+    if failure:
+        print("error: series interrupted, partial results kept: %s" %
+              failure, file=sys.stderr)
+        return 1
     return 0
 
 
@@ -533,6 +621,20 @@ def build_parser():
                    help="output directory (default: benchmarks/results)")
     p.add_argument("--suffix", default="",
                    help="adds _SUFFIX to the names of all output files")
+    p.add_argument("--server", choices=("external", "spawn"),
+                   default="external",
+                   help="external: use the running server at --host; spawn: "
+                   "start a fresh server (EXPANSION=off) for every N and "
+                   "record peak_rss_mb (Linux) (default: %(default)s)")
+    p.add_argument("--server-bin",
+                   default=os.path.join(REPO_ROOT, "build", "search_server"),
+                   help="server binary for --server spawn")
+    p.add_argument("--dataset", default="",
+                   help="DATASET_DIR for --server spawn (default: server's)")
+    p.add_argument("--web-dir", default="",
+                   help="WEB_DIR for --server spawn (default: server's)")
+    p.add_argument("--ollama-host", default="",
+                   help="OLLAMA_HOST for --server spawn (default: server's)")
     p.set_defaults(func=cmd_index)
 
     p = sub.add_parser("throughput", help="requests/s vs concurrent clients")
