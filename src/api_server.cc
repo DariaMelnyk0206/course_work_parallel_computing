@@ -272,7 +272,8 @@ void ApiServer::RegisterWebSocket() {
         if (!SendJson(ws, {{"stage", "keyword_search"},
                            {"data",
                             {{"results", std::move(results)},
-                             {"time_ms", found.search_time_ms}}}})) {
+                             {"time_ms", found.search_time_ms},
+                             {"total_matches", found.total_matches}}}})) {
           return;
         }
 
