@@ -103,6 +103,178 @@ async function runIndex() {
   }
 }
 
+// ---- Search over WebSocket with pipeline stage visualization ----
+
+const STAGES = ["query_expansion", "keyword_search", "done"];
+const STATE_LABELS = {
+  pending: "очікування",
+  running: "виконується",
+  done: "завершено",
+  error: "помилка",
+};
+
+// State of the current search; `socket` is null when no search is active.
+const search = { socket: null, sentAt: 0, finished: false };
+
+function stageElement(name) {
+  return document.getElementById("stage-" + name);
+}
+
+function getStageState(name) {
+  return stageElement(name).dataset.state;
+}
+
+function setStage(name, state, ms) {
+  const element = stageElement(name);
+  element.dataset.state = state;
+  setText(element.querySelector(".stage-state"), STATE_LABELS[state]);
+  setText(element.querySelector(".stage-time"),
+          ms === undefined ? "" : ms + " мс");
+}
+
+function showError(text) {
+  setText(dom.errorArea, text);
+}
+
+function renderTerms(terms) {
+  dom.termsList.replaceChildren();
+  for (const term of terms) {
+    const item = document.createElement("li");
+    setText(item, term);
+    dom.termsList.appendChild(item);
+  }
+}
+
+function renderResults(results) {
+  dom.resultsList.replaceChildren();
+  for (const result of results) {
+    const item = document.createElement("li");
+    const id = document.createElement("span");
+    id.className = "doc-id";
+    setText(id, result.doc_id);
+    const score = document.createElement("span");
+    score.className = "score";
+    setText(score, "score: " + Number(result.score).toFixed(4));
+    const snippet = document.createElement("p");
+    snippet.className = "snippet";
+    setText(snippet, result.snippet);
+    item.append(id, score, snippet);
+    dom.resultsList.appendChild(item);
+  }
+}
+
+function resetPipeline() {
+  for (const name of STAGES) {
+    setStage(name, "pending");
+  }
+  renderTerms([]);
+  renderResults([]);
+  showError("");
+}
+
+// Marks the stage that is currently running as failed; falls back to
+// query_expansion when no stage was running (e.g. connection never opened).
+function failRunningStage() {
+  const running = STAGES.find((name) => getStageState(name) === "running");
+  setStage(running || STAGES[0], "error");
+}
+
+function closeSocket() {
+  const socket = search.socket;
+  search.socket = null;
+  if (socket) {
+    socket.close();
+  }
+}
+
+function handleMessage(message) {
+  const data = message.data || {};
+  switch (message.stage) {
+    case "query_expansion":
+      setStage("query_expansion", "done", Date.now() - search.sentAt);
+      setStage("keyword_search", "running");
+      renderTerms(Array.isArray(data.expanded_terms) ? data.expanded_terms
+                                                     : []);
+      break;
+    case "keyword_search":
+      setStage("keyword_search", "done", data.time_ms);
+      setStage("done", "running");
+      renderResults(Array.isArray(data.results) ? data.results : []);
+      break;
+    case "done":
+      setStage("done", "done", data.total_time_ms);
+      search.finished = true;
+      closeSocket();
+      dom.searchButton.disabled = false;
+      break;
+    case "error":
+      failRunningStage();
+      showError(typeof data.message === "string" ? data.message
+                                                 : "помилка сервера");
+      search.finished = true;
+      closeSocket();
+      dom.searchButton.disabled = false;
+      break;
+    default:
+      break;
+  }
+}
+
+function openSocket(query) {
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(scheme + "//" + location.host + "/ws/search");
+  search.socket = socket;
+  search.finished = false;
+
+  // A connection drop before `done`/`error` is reported once per socket;
+  // events from superseded sockets are ignored.
+  const onDrop = () => {
+    if (search.socket !== socket || search.finished) {
+      return;
+    }
+    search.finished = true;
+    search.socket = null;
+    failRunningStage();
+    showError("з'єднання розірвано");
+    dom.searchButton.disabled = false;
+  };
+
+  socket.onopen = () => {
+    search.sentAt = Date.now();
+    setStage("query_expansion", "running");
+    socket.send(JSON.stringify({ query: query }));
+  };
+  socket.onmessage = (event) => {
+    if (search.socket !== socket) {
+      return;
+    }
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch (e) {
+      return;
+    }
+    if (message && typeof message === "object") {
+      handleMessage(message);
+    }
+  };
+  socket.onerror = onDrop;
+  socket.onclose = onDrop;
+}
+
+function runSearch(query) {
+  const trimmed = query.trim();
+  if (trimmed === "") {
+    resetPipeline();
+    showError("Запит не може бути порожнім");
+    return;
+  }
+  closeSocket();
+  resetPipeline();
+  dom.searchButton.disabled = true;
+  openSocket(trimmed);
+}
+
 function init() {
   dom.serverIndicator = document.getElementById("server-indicator");
   dom.serverStatus = document.getElementById("server-status");
@@ -115,6 +287,18 @@ function init() {
   dom.indexThreads = document.getElementById("index-threads");
   dom.indexButton = document.getElementById("index-button");
   dom.indexResult = document.getElementById("index-result");
+
+  dom.searchForm = document.getElementById("search-form");
+  dom.searchQuery = document.getElementById("search-query");
+  dom.searchButton = document.getElementById("search-button");
+  dom.errorArea = document.getElementById("error-area");
+  dom.termsList = document.getElementById("terms-list");
+  dom.resultsList = document.getElementById("results-list");
+
+  dom.searchForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    runSearch(dom.searchQuery.value);
+  });
 
   dom.indexForm.addEventListener("submit", (event) => {
     event.preventDefault();
