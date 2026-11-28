@@ -205,8 +205,8 @@ IndexBuildResult IndexBuilder::Build(const std::string& dataset_dir,
 
   const uint32_t count = indexed.load(std::memory_order_relaxed);
   Logger::Instance().Info(
-      "Index built: " + std::to_string(count) + " documents, " +
-      std::to_string(table.UniqueTermCount()) + " unique terms");
+      "Index stats: documents=" + std::to_string(count) +
+      ", unique_terms=" + std::to_string(table.UniqueTermCount()));
 
   IndexBuildResult result;
   result.documents_indexed = count;
