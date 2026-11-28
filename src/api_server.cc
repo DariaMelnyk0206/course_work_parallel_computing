@@ -1,5 +1,7 @@
 #include "api_server.h"
 
+#include <sys/socket.h>
+
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -46,6 +48,12 @@ ApiServer::ApiServer(Config config, std::shared_ptr<SearchService> service)
     return new ThreadPool(static_cast<size_t>(threads),
                           static_cast<size_t>(queue));
   };
+  // cpp-httplib's default options enable SO_REUSEPORT where available, which
+  // lets a second process bind the same port. Use SO_REUSEADDR only, so a
+  // busy port makes listen() fail while TIME_WAIT sockets stay reusable.
+  server_.set_socket_options([](socket_t sock) {
+    httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+  });
   server_.set_keep_alive_timeout(kKeepAliveTimeoutSec);
   server_.set_keep_alive_max_count(kKeepAliveMaxCount);
   server_.set_payload_max_length(kPayloadMaxBytes);
