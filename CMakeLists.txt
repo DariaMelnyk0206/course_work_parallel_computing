@@ -58,5 +58,10 @@ target_link_libraries(search_core PUBLIC
 add_executable(search_server src/main.cc)
 target_link_libraries(search_server PRIVATE search_core)
 
+add_executable(search cli/main.cc cli/search_cli.cc)
+target_include_directories(search PRIVATE cli)
+target_link_libraries(search PRIVATE
+  search_build_options httplib::httplib nlohmann_json::nlohmann_json)
+
 add_executable(index_stress_test tests/index_stress_test.cc)
 target_link_libraries(index_stress_test PRIVATE search_core)
