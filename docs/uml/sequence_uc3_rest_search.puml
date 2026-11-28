@@ -1,0 +1,65 @@
+@startuml sequence_uc3_rest_search
+title UC-3: Пошук через REST (POST /api/search)
+skinparam responseMessageBelowArrow true
+actor "Користувач CLI" as Cli
+participant "ApiServer\n(handler у потоці request_pool)" as Api
+participant "SearchService" as Svc
+participant "Tokenizer" as Tok
+participant "OllamaClient" as Ollama
+participant "std::timed_mutex\n(черга LLM)" as Mtx
+participant "Ollama\n(/api/generate)" as Llm
+participant "InvertedIndex\n(знімок)" as Idx
+participant "StripedHashTable\n(shared_mutex стрипа)" as Tbl
+participant "Ranker" as Rank
+
+Cli -> Api : POST /api/search\n{"query": "...", "mode": "keyword"}
+note right of Api
+  З'єднання обслуговує окремий потік request_pool
+end note
+Api -> Api : валідація JSON, query, mode
+alt невалідний запит
+  Api --> Cli : 400 {"error": "..."}
+else валідний запит
+  Api -> Svc : Search(query)
+  Svc -> Svc : t0 = steady_clock::now()
+  Svc -> Tok : Tokenize(query)
+  Tok --> Svc : оригінальні терміни
+  Svc -> Ollama : Expand(query, original_terms)
+  Ollama -> Mtx : try_lock_for(залишок LLM_TIMEOUT_MS)
+  alt м'ютекс отримано в межах бюджету
+    Ollama -> Llm : POST /api/generate (timeout = залишок бюджету)
+    alt успішна відповідь
+      Llm --> Ollama : response
+      Ollama -> Tok : Tokenize(response)
+      Ollama -> Mtx : unlock()
+      Ollama --> Svc : нові терміни (≤ 10)
+    else помилка / тайм-аут HTTP / порожній розбір
+      Ollama -> Mtx : unlock()
+      Ollama --> Svc : fallback: порожній список, подія в лог
+    end
+  else бюджет вичерпано в черзі
+    Ollama --> Svc : fallback: порожній список, подія в лог
+  end
+  note over Svc
+    expanded_terms = оригінальні (w=2) + нові (w=1).
+    М'ютекс LLM вже звільнено, індекс під час очікування LLM не блокується.
+  end note
+  Svc -> Svc : знімок = копія shared_ptr під коротким mutex
+  loop для кожного терміна з expanded_terms
+    Svc -> Idx : Lookup(term)
+    Idx -> Tbl : Lookup(term, hash)
+    note right of Tbl : shared_lock на один стрип,\nкопія списку постингів
+    Tbl --> Idx : postings
+    Idx --> Svc : postings (df = size)
+  end
+  Svc -> Rank : Rank(postings, N, top_k)
+  Rank --> Svc : top-k за score, snippet із DocumentTable
+  Svc -> Svc : time_ms = повний час (expansion + пошук)
+  Svc --> Api : результати, time_ms
+  Api --> Cli : 200 {"results": [{doc_id, score, snippet}], "time_ms": T}
+end
+note over Cli, Api
+  Той самий пайплайн, що в UC-2, але одна відповідь
+  замість трьох WS-повідомлень.
+end note
+@enduml
