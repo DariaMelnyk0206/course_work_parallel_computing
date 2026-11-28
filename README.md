@@ -33,6 +33,17 @@ python3 scripts/prepare_dataset.py --out ./dataset_small --limit 200
 ```
 
 Скрипт завантажує файли паралельно і дозавантажує лише ті, що відсутні або мають неправильний розмір.
+Додатково він завантажує `metadata.csv` (назви книг) у ту саму теку `--out`, також при `--limit`
+(файл пропускається, якщо розмір збігається).
+
+### Назви книг (`metadata.csv`)
+
+Рядки `metadata.csv` мають вигляд `id,title,year,url` без заголовка. Під час індексації сервер читає
+`<DATASET_DIR>/metadata.csv`, якщо він є: `id` береться до першої коми, `url` після останньої, `year` між
+передостанньою й останньою комами, а `title` є рештою посередині, тож коми в назві не ламають розбір.
+Для файлу `<id>.txt` назва формується як `<title> (<year>)`, наприклад `The Complete Works of William Shakespeare (1623)`.
+Для файлів з нечисловим іменем, а також якщо `metadata.csv` немає, назва порожня (у лог пишеться повідомлення рівня Info).
+`metadata.csv` не індексується, бо це не `*.txt`. Назви повертає лише WebSocket (поле `title`), REST їх не містить.
 Сервер рекурсивно шукає `*.txt` у теці `DATASET_DIR`. Якщо тека порожня або відсутня, сервер стартує штатно,
 а індексація повертає `documents_indexed: 0`.
 
@@ -71,7 +82,7 @@ docker compose up ollama-init
 ## REST API
 
 Усі відповіді мають `Content-Type: application/json`, включно з помилками (поле `error`).
-Сервер слухає порт `8080`. Приклади нижче виконано на корпусі з двох невеликих файлів.
+Сервер слухає порт `8080`. Приклади нижче виконано на теці з п'яти книг (`10`, `100`, `102`, `103`, `105`) і `metadata.csv`, без Ollama (тому `expanded_terms` збігаються з термінами запиту).
 
 ### `GET /api/health`
 
@@ -97,7 +108,7 @@ curl -X POST http://localhost:8080/api/index \
 ```
 
 ```json
-{"documents_indexed":2,"status":"ok","time_ms":8}
+{"documents_indexed":5,"status":"ok","time_ms":77}
 ```
 
 Паралельний `POST /api/index` під час побудови повертає 409 `{"error": "Indexing already in progress"}`.
@@ -108,12 +119,15 @@ curl -X POST http://localhost:8080/api/index \
 ```bash
 curl -X POST http://localhost:8080/api/search \
   -H 'Content-Type: application/json' \
-  -d '{"query": "ghost", "mode": "keyword"}'
+  -d '{"query": "ocean voyage", "mode": "keyword"}'
 ```
 
 ```json
-{"results":[{"doc_id":"1.txt","score":1.0,"snippet":"The ghost walked the ocean voyage at night. ..."}],"time_ms":0}
+{"results":[{"doc_id":"100.txt","score":1.0,"snippet":"...spirit of love, with a perpetual dulness: Let this sad interim like the ocean be Which parts the shore, where two contracted new, Come daily to the..."},{"doc_id":"103.txt","score":1.0,"snippet":"...MORE, PERHAPS, THAN IS PRUDENT IX IN WHICH THE RED SEA AND THE INDIAN OCEAN PROVE PROPITIOUS TO THE DESIGNS OF PHILEAS FOGG X IN WHICH PASSEPARTOUT..."},{"doc_id":"10.txt","score":0.4391,"snippet":"...admonished them, 27:10 And said unto them, Sirs, I perceive that this voyage will be with hurt and much damage, not only of the lading and ship, but..."}],"time_ms":1}
 ```
+
+Елемент `results` має лише поля `doc_id`, `score` і `snippet` (контракт фіксований, `title` і `total_matches`
+у REST немає). Опис `snippet` дивіться в розділі «Уривки (snippet)».
 
 Запит розширюється через Ollama, потім терміни шукаються в індексі. Якщо Ollama недоступна або не вклалась у
 `LLM_TIMEOUT_MS`, пошук виконується за термінами запиту. Дозволений лише `"mode": "keyword"`.
@@ -132,7 +146,7 @@ curl http://localhost:8080/api/stats
 ```
 
 ```json
-{"documents":2,"index_build_time_ms":8,"threads_used":4}
+{"documents":5,"index_build_time_ms":77,"threads_used":4}
 ```
 
 До першої індексації: `{"documents":0,"index_build_time_ms":0,"threads_used":0}`.
@@ -147,11 +161,32 @@ curl http://localhost:8080/api/stats
 | 413 | тіло запиту більше 1 МБ |
 | 500 | внутрішня помилка |
 
+## Уривки (snippet)
+
+Є два види уривків.
+
+- **Статичний.** Формується під час індексації й зберігається в пам'яті: до 160 байтів, що починаються зі зсуву
+  `min(4096, розмір_файлу / 4)`, з вирівнюванням за межею слова і стисненням пробільних символів в один пробіл.
+  Зсув потрібен, бо початок файлів PG-19 займає службовий текст Project Gutenberg.
+- **KWIC (keyword in context), основний.** Будується під час пошуку лише для top-k результатів. Для кожного документа
+  `Ranker` запам'ятовує зсув першого входження терміна з найбільшою вагою `w·IDF` (за рівності перемагає термін,
+  що раніше в `expanded_terms`). Після вибору top-k сервер відкриває файл `DATASET_DIR/<relative_path>` без жодних
+  блокувань і читає близько 100 байтів до і після цього слова. Початок і кінець вирівнюються за межею слова,
+  пробіли стискаються, довжина не перевищує 160 байтів, слово-якір лишається всередині. Якщо уривок обрізано
+  зліва або справа, додається ASCII `...`.
+- **Запасний варіант.** Якщо файл недоступний або коротший за зсув, або за зсувом уже не стоїть слово-якір
+  (без урахування регістру, межі токена за правилами `Tokenizer`), повертається статичний уривок.
+
+Читання вікон під час пошуку повільніше за уривок з пам'яті, але дає контекст навколо збігу. Цей час входить у `time_ms`.
+
 ## WebSocket `/ws/search`
 
 Клієнт надсилає `{"query": "..."}`, сервер надсилає по одному повідомленню на етап:
 `query_expansion` → `keyword_search` → `done`. Після `done` з'єднання залишається відкритим.
-У `keyword_search` поле `total_matches` — кількість усіх знайдених документів до обрізання до `TOP_K` (у відповіді REST цього поля немає, контракт фіксований).
+Формат `results` у WebSocket відрізняється від REST двома полями. Кожен елемент має `doc_id`, `score`, `snippet` і `title`
+(назва книги з `metadata.csv`, рядок, може бути порожнім). На рівні `data` додається `total_matches`: кількість усіх
+документів зі score > 0 до обрізання до `TOP_K`. Web UI показує «Показано N з M», де N — довжина `results`, M — `total_matches`.
+У відповіді REST цих двох полів немає, її контракт фіксований Силабусом.
 У разі помилки (невалідний JSON або порожній `query`) приходить `{"stage": "error", ...}`
 і сервер закриває з'єднання.
 
@@ -166,7 +201,7 @@ import asyncio, json, websockets
 
 async def main():
     async with websockets.connect("ws://localhost:8080/ws/search") as ws:
-        await ws.send(json.dumps({"query": "ghost"}))
+        await ws.send(json.dumps({"query": "ocean voyage"}))
         for _ in range(3):
             print(await ws.recv())
 
@@ -176,9 +211,9 @@ asyncio.run(main())
 Вивід:
 
 ```json
-{"data":{"expanded_terms":["ghost"],"original":"ghost"},"stage":"query_expansion"}
-{"data":{"results":[{"doc_id":"1.txt","score":1.0,"snippet":"The ghost walked the ocean voyage at night. ..."}],"time_ms":0,"total_matches":1},"stage":"keyword_search"}
-{"data":{"total_time_ms":0},"stage":"done"}
+{"data":{"expanded_terms":["ocean","voyage"],"original":"ocean voyage"},"stage":"query_expansion"}
+{"data":{"results":[{"doc_id":"100.txt","score":1.0,"snippet":"...spirit of love, with a perpetual dulness: Let this sad interim like the ocean be Which parts the shore, where two contracted new, Come daily to the...","title":"The Complete Works of William Shakespeare (1623)"},{"doc_id":"103.txt","score":1.0,"snippet":"...MORE, PERHAPS, THAN IS PRUDENT IX IN WHICH THE RED SEA AND THE INDIAN OCEAN PROVE PROPITIOUS TO THE DESIGNS OF PHILEAS FOGG X IN WHICH PASSEPARTOUT...","title":"Around the World in 80 Days by Jules Verne (1873)"},{"doc_id":"10.txt","score":0.4391,"snippet":"...admonished them, 27:10 And said unto them, Sirs, I perceive that this voyage will be with hurt and much damage, not only of the lading and ship, but...","title":"The Bible Both Testaments King James Version (1611)"}],"time_ms":0,"total_matches":3},"stage":"keyword_search"}
+{"data":{"total_time_ms":1},"stage":"done"}
 ```
 
 Із працюючою Ollama `expanded_terms` містить додаткові терміни від LLM після термінів запиту.
@@ -198,12 +233,12 @@ cmake --build build --target search_server search
 Використання:
 
 ```bash
-./build/search "ghost"                 # пошук
+./build/search "ocean voyage"          # пошук
 ./build/search --top 5 "ocean voyage"  # не більше 5 результатів
 ./build/search --index 8               # індексація з 8 потоками
 ./build/search --stats                 # статистика
 ./build/search --health                # стан сервера та Ollama
-./build/search --host http://localhost:8080 "ghost"
+./build/search --host http://localhost:8080 "ocean voyage"
 ```
 
 Адресу сервера можна задати прапорцем `--host` або змінною `SEARCH_HOST` (за замовчуванням `http://localhost:8080`).
@@ -211,8 +246,10 @@ cmake --build build --target search_server search
 
 ```text
 Rank  doc_id           Score    Snippet
-1     1.txt            1.0000   The ghost walked the ocean voyage at night. ...
-1 results in 0 ms
+1     100.txt          1.0000   ...spirit of love, with a perpetual dulness: Let this sad interim like the ocean be Which parts the shore, where two contracted new, Come daily to the...
+2     103.txt          1.0000   ...MORE, PERHAPS, THAN IS PRUDENT IX IN WHICH THE RED SEA AND THE INDIAN OCEAN PROVE PROPITIOUS TO THE DESIGNS OF PHILEAS FOGG X IN WHICH PASSEPARTOUT...
+3     10.txt           0.4391   ...admonished them, 27:10 And said unto them, Sirs, I perceive that this voyage will be with hurt and much damage, not only of the lading and ship, but...
+3 results in 1 ms
 ```
 
 Коди виходу: 0 — успіх, 1 — помилка сервера або мережі, 2 — некоректні аргументи.
@@ -221,7 +258,7 @@ Rank  doc_id           Score    Snippet
 
 ```bash
 docker compose exec search-server search --index 8
-docker compose exec search-server search "ghost"
+docker compose exec search-server search "ocean voyage"
 docker compose exec search-server search --stats
 ```
 
@@ -370,4 +407,12 @@ docker run --rm -v "$PWD/docs/uml:/data" plantuml/plantuml -tpng "/data/*.puml"
   пошук виконується лише за термінами запиту.
 - **Ранжування** базується на нормованій сумі IDF без урахування частоти термінів у документі.
 - **Один процес на порт.** Сервер вмикає лише `SO_REUSEADDR` (без `SO_REUSEPORT`), тож другий процес на зайнятому порту не стартує. Швидкий перезапуск після зупинки працює.
+- **Файли понад 4 ГБ не підтримуються.** Зсув у постингу має тип `uint32_t`. Найбільший файл корпусу близько 29 МБ.
+- **Зсув першого входження.** Для кожного терміна в документі зберігається лише зсув першого входження, тому KWIC-уривок
+  показує контекст першого збігу, а не найкращого.
+- **Запис індексу подвоєний.** Постинг `{doc_id, offset}` займає 8 байтів замість 4. Це свідомий компроміс між якістю
+  уривка і пам'яттю: індекс у RAM приблизно вдвічі більший за варіант без зсувів.
+- **Читання вікон під час пошуку.** Кожен пошук додатково читає з диска до `TOP_K` невеликих вікон, що додає затримку,
+  особливо на холодному кеші ОС або повільному bind-mount.
+- якщо файл змінено після індексації, але за збереженим зсувом стоїть те саме слово, уривок береться з нового вмісту без повторної індексації.
 - Індекс зберігається лише в пам'яті і будується заново після кожного старту сервера. Хеш-таблиця має фіксовану кількість бакетів (без рехешування).
