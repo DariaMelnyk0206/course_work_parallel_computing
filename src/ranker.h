@@ -1,6 +1,7 @@
 #ifndef SEARCH_ENGINE_RANKER_H_
 #define SEARCH_ENGINE_RANKER_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -31,9 +32,13 @@ class Ranker {
  public:
   // Returns at most `top_k` results sorted by score descending, ties broken
   // by doc_id ascending (Requirement 16.7). Returns an empty vector if the
-  // weighted denominator is zero (Requirement 16.5).
+  // weighted denominator is zero (Requirement 16.5). If `total_matches` is
+  // not null, it receives the number of documents with score > 0 before the
+  // top-k cut (the size of the already computed candidate set; 0 when the
+  // result is empty). It is shown by the WebSocket stage only (R19.4).
   static std::vector<SearchResult> Rank(const std::vector<WeightedTerm>& terms,
-                                        const InvertedIndex& index, int top_k);
+                                        const InvertedIndex& index, int top_k,
+                                        size_t* total_matches = nullptr);
 };
 
 }  // namespace search_engine

@@ -21,7 +21,9 @@ double RoundTo4Decimals(double value) { return std::round(value * 1e4) / 1e4; }
 }  // namespace
 
 std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
-                                       const InvertedIndex& index, int top_k) {
+                                       const InvertedIndex& index, int top_k,
+                                       size_t* total_matches) {
+  if (total_matches != nullptr) *total_matches = 0;
   if (top_k <= 0 || terms.empty()) return {};
 
   const double document_count = static_cast<double>(index.DocumentCount());
@@ -52,6 +54,7 @@ std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
     for (uint32_t doc_id : postings[i]) numerators[doc_id] += term_weights[i];
   }
 
+  if (total_matches != nullptr) *total_matches = numerators.size();
   std::vector<ScoredDoc> scored;
   scored.reserve(numerators.size());
   for (const auto& [doc_id, numerator] : numerators) {

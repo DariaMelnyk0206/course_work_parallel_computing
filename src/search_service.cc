@@ -93,8 +93,8 @@ KeywordSearchOutcome SearchService::RunKeywordSearch(
   const auto start = std::chrono::steady_clock::now();
   std::shared_ptr<const InvertedIndex> index = CurrentIndex();
   if (index != nullptr && !expansion.weighted_terms.empty()) {
-    outcome.results =
-        Ranker::Rank(expansion.weighted_terms, *index, config_.top_k);
+    outcome.results = Ranker::Rank(expansion.weighted_terms, *index,
+                                   config_.top_k, &outcome.total_matches);
   }
   outcome.search_time_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(

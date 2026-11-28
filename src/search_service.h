@@ -40,6 +40,7 @@ struct QueryExpansion {
 // Result of the second pipeline stage (Requirement 19.4).
 struct KeywordSearchOutcome {
   std::vector<SearchResult> results;
+  size_t total_matches = 0;    // Documents with score > 0 before the top-k cut.
   int64_t search_time_ms = 0;  // Index lookup + ranking only.
 };
 
