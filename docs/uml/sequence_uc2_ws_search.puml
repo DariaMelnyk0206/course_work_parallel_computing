@@ -1,0 +1,79 @@
+@startuml sequence_uc2_ws_search
+title UC-2: Пошук зі стрімінгом етапів (WS /ws/search)
+skinparam responseMessageBelowArrow true
+
+actor "Користувач Web UI" as U
+participant "Web UI (app.js)" as UI
+participant "ApiServer\n(httplib)" as API
+participant "request_pool\n(ThreadPool)" as RP
+participant "SearchService" as SVC
+participant "Tokenizer" as TK
+participant "OllamaClient" as OC
+participant "generate_mutex_\n(std::timed_mutex)" as MX
+participant "Ollama\n(контейнер)" as OL
+participant "InvertedIndex\n(знімок)" as IDX
+participant "StripedHashTable\n(shared_mutex стрипа)" as HT
+participant "Ranker" as RK
+
+U -> UI : вводить запит
+UI -> API : WebSocket connect /ws/search
+API -> RP : enqueue(з'єднання)
+activate RP
+note right of RP : Потік request_pool обслуговує\nвсю WS-сесію
+
+UI -> RP : {"query": "..."}
+RP -> RP : валідація JSON і query
+alt невалідний JSON або порожній query
+  RP --> UI : {"stage":"error","data":{"message":"..."}}
+  RP -> UI : close(1008)
+else запит коректний
+  == Етап 1: query_expansion ==
+  RP -> SVC : ExpandQuery(query)
+  SVC -> TK : Tokenize(query)
+  TK --> SVC : original_terms
+  SVC -> OC : Expand(query, original_terms)
+  OC -> MX : try_lock_for(LLM_TIMEOUT_MS)
+  alt м'ютекс отримано в межах бюджету
+    MX --> OC : locked
+    OC -> OL : POST /api/generate (read timeout = залишок бюджету)
+    alt Ollama відповіла вчасно
+      OL --> OC : response
+      OC -> TK : Tokenize(response)
+      TK --> OC : терміни
+      OC -> OC : dedup, прибрати original_terms,\nне більше 10 нових
+    else тайм-аут або HTTP-помилка
+      OL --> OC : помилка
+      OC -> OC : fallback: new_terms = [] (запис у лог)
+    end
+    OC -> MX : unlock()
+  else бюджет вичерпано в черзі
+    MX --> OC : не отримано
+    OC -> OC : fallback: new_terms = [] (запис у лог)
+  end
+  note over OC, MX : М'ютекс LLM звільнено до звернення до індексу
+  OC --> SVC : new_terms
+  SVC --> RP : QueryExpansion\n(original_terms + new_terms)
+  RP --> UI : {"stage":"query_expansion","data":{"original","expanded_terms"}}
+
+  == Етап 2: keyword_search ==
+  RP -> SVC : RunKeywordSearch(expansion)
+  SVC -> SVC : CurrentIndex() (копія shared_ptr під mutex)
+  loop кожен термін t з expanded_terms
+    SVC -> IDX : Lookup(t)
+    IDX -> HT : Lookup(t, hash)
+    HT -> HT : shared_lock на стрип,\nкопія постингів
+    HT --> IDX : postings
+    IDX --> SVC : postings
+  end
+  SVC -> RK : Rank(weighted_terms, postings)
+  RK --> SVC : top-K результатів (score, doc_id)
+  SVC --> RP : results, search_time_ms
+  RP --> UI : {"stage":"keyword_search","data":{"results","time_ms"}}
+
+  == Етап 3: done ==
+  RP --> UI : {"stage":"done","data":{"total_time_ms"}}
+  note right of UI : З'єднання лишається відкритим;\nWeb UI закриває його після done
+end
+deactivate RP
+UI -> U : відображає етапи, expanded_terms і результати
+@enduml
