@@ -47,5 +47,9 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  tsan:
+    profiles: ["tsan"]
+    build: { context: ., dockerfile: Dockerfile, target: tsan }
+
 volumes:
   ollama_data:
