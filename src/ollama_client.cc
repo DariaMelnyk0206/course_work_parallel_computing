@@ -137,8 +137,41 @@ ExpansionResult OllamaClient::Expand(
   }
 }
 
-// Stub: the /api/tags check is added later.
-bool OllamaClient::IsAvailable() const { return false; }
+bool OllamaClient::IsAvailable() const {
+  try {
+    constexpr std::chrono::seconds kTimeout(1);
+    httplib::Client client(host_);
+    client.set_connection_timeout(kTimeout);
+    client.set_read_timeout(kTimeout);
+    client.set_write_timeout(kTimeout);
+
+    httplib::Result http = client.Get("/api/tags");
+    if (!http || http->status != 200) return false;
+    const nlohmann::json json =
+        nlohmann::json::parse(http->body, nullptr, false);
+    if (!json.is_object() || !json.contains("models") ||
+        !json["models"].is_array()) {
+      return false;
+    }
+    const std::string with_latest = model_ + ":latest";
+    for (const nlohmann::json& entry : json["models"]) {
+      if (!entry.is_object()) continue;
+      for (const char* key : {"name", "model"}) {
+        auto it = entry.find(key);
+        if (it == entry.end() || !it->is_string()) continue;
+        const std::string& name = it->get_ref<const std::string&>();
+        if (name == model_ || name == with_latest) return true;
+      }
+    }
+    return false;
+  } catch (const std::exception& e) {
+    Logger::Instance().Warn(std::string("Ollama availability check: ") +
+                            e.what());
+    return false;
+  } catch (...) {
+    return false;
+  }
+}
 
 std::string OllamaClient::BuildPrompt(const std::string& original_query) {
   return "List 5 to 7 English keywords and synonyms for this search query, "
