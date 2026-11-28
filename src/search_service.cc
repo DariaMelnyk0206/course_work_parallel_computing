@@ -1,5 +1,9 @@
 #include "search_service.h"
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 #include <cstddef>
 #include <filesystem>
 #include <optional>
@@ -148,11 +152,23 @@ std::shared_ptr<const InvertedIndex> SearchService::CurrentIndex() const {
 void SearchService::PublishIndex(std::shared_ptr<const InvertedIndex> next,
                                  uint32_t docs, int64_t build_time_ms,
                                  int threads) {
-  std::lock_guard<std::mutex> lock(index_mutex_);
-  index_ = std::move(next);
-  stats_.documents = docs;
-  stats_.index_build_time_ms = build_time_ms;
-  stats_.threads_used = threads;
+  std::shared_ptr<const InvertedIndex> old_index;
+  {
+    std::lock_guard<std::mutex> lock(index_mutex_);
+    old_index = std::move(index_);
+    index_ = std::move(next);
+    stats_.documents = docs;
+    stats_.index_build_time_ms = build_time_ms;
+    stats_.threads_used = threads;
+  }
+  // The lock is released; the old index (a large destructor) is freed here,
+  // outside the mutex, unless a running search still holds a snapshot.
+  old_index.reset();
+#ifdef __GLIBC__
+  // Returns memory of the old index to the operating system: glibc does not
+  // give back freed memory from per-thread arenas on its own.
+  malloc_trim(0);
+#endif
 }
 
 }  // namespace search_engine
