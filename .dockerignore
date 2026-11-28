@@ -1,0 +1,6 @@
+dataset/
+build/
+build-*/
+.git/
+.kiro/
+benchmarks/results/
