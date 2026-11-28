@@ -5,8 +5,11 @@
 #endif
 
 #include <cstddef>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <optional>
+#include <string>
 #include <unordered_set>
 #include <utility>
 
@@ -17,6 +20,38 @@
 #include "tokenizer.h"
 
 namespace search_engine {
+
+namespace {
+
+// Reads a "<key>:   <value> kB" line from /proc/self/status and returns the
+// value in MB, or -1 when unavailable. Linux only; never throws.
+double ReadProcStatusMb(const std::string& key) {
+#ifdef __linux__
+  try {
+    std::ifstream in("/proc/self/status");
+    std::string line;
+    const std::string prefix = key + ":";
+    while (std::getline(in, line)) {
+      if (line.compare(0, prefix.size(), prefix) == 0) {
+        double kb = std::stod(line.substr(prefix.size()));
+        return kb / 1024.0;
+      }
+    }
+  } catch (...) {
+  }
+#else
+  (void)key;
+#endif
+  return -1.0;
+}
+
+std::string FormatMb(double mb) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.1f", mb);
+  return buf;
+}
+
+}  // namespace
 
 SearchService::SearchService(Config config)
     : config_(std::move(config)),
@@ -56,6 +91,16 @@ IndexOutcome SearchService::BuildIndex(int num_threads,
       IndexBuilder::Build(config_.dataset_dir, num_threads);
   PublishIndex(std::move(result.index), result.documents_indexed,
                result.time_ms, num_threads);
+  std::string memory;
+  const double rss_mb = ReadProcStatusMb("VmRSS");
+  const double hwm_mb = ReadProcStatusMb("VmHWM");
+  if (rss_mb >= 0 && hwm_mb >= 0)
+    memory = ", VmRSS=" + FormatMb(rss_mb) + " MB, VmHWM=" + FormatMb(hwm_mb) +
+             " MB";
+  Logger::Instance().Info(
+      "Index built: documents=" + std::to_string(result.documents_indexed) +
+      ", threads=" + std::to_string(num_threads) +
+      ", time_ms=" + std::to_string(result.time_ms) + memory);
   if (documents_indexed != nullptr)
     *documents_indexed = result.documents_indexed;
   if (time_ms != nullptr) *time_ms = result.time_ms;
