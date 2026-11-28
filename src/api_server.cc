@@ -30,6 +30,22 @@ bool IsBlank(const std::string& s) {
   return s.find_first_not_of(" \t\n\r\f\v") == std::string::npos;
 }
 
+// Serializes ranked results. REST omits "title" (fixed Syllabus contract);
+// the WebSocket keyword_search stage includes it (Requirement 19.4).
+nlohmann::json ToJson(const std::vector<SearchResult>& results,
+                      bool with_title) {
+  nlohmann::json array = nlohmann::json::array();
+  for (const SearchResult& r : results) {
+    nlohmann::json item = {
+        {"doc_id", r.doc_id}, {"score", r.score}, {"snippet", r.snippet}};
+    if (with_title) {
+      item["title"] = r.title;
+    }
+    array.push_back(std::move(item));
+  }
+  return array;
+}
+
 void SetError(httplib::Response& res, int status, const std::string& message) {
   res.status = status;
   res.set_content(DumpJson({{"error", message}}), "application/json");
@@ -166,11 +182,7 @@ void ApiServer::RegisterSearch() {
       const KeywordSearchOutcome outcome =
           service_->RunKeywordSearch(expansion);
 
-      nlohmann::json results = nlohmann::json::array();
-      for (const SearchResult& r : outcome.results) {
-        results.push_back(
-            {{"doc_id", r.doc_id}, {"score", r.score}, {"snippet", r.snippet}});
-      }
+      nlohmann::json results = ToJson(outcome.results, /*with_title=*/false);
       const int64_t total_ms =
           std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::steady_clock::now() - start)
@@ -263,12 +275,7 @@ void ApiServer::RegisterWebSocket() {
 
         const KeywordSearchOutcome found =
             service_->RunKeywordSearch(expansion);
-        nlohmann::json results = nlohmann::json::array();
-        for (const SearchResult& r : found.results) {
-          results.push_back({{"doc_id", r.doc_id},
-                             {"score", r.score},
-                             {"snippet", r.snippet}});
-        }
+        nlohmann::json results = ToJson(found.results, /*with_title=*/true);
         if (!SendJson(ws, {{"stage", "keyword_search"},
                            {"data",
                             {{"results", std::move(results)},
