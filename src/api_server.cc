@@ -1,5 +1,6 @@
 #include "api_server.h"
 
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <string>
@@ -20,6 +21,10 @@ constexpr time_t kKeepAliveTimeoutSec = 2;
 // Replaces invalid UTF-8 instead of throwing (PD Section 6.2).
 std::string DumpJson(const nlohmann::json& body) {
   return body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+bool IsBlank(const std::string& s) {
+  return s.find_first_not_of(" \t\n\r\f\v") == std::string::npos;
 }
 
 void SetError(httplib::Response& res, int status, const std::string& message) {
@@ -49,6 +54,7 @@ ApiServer::ApiServer(Config config, std::shared_ptr<SearchService> service)
   }
   RegisterHealth();
   RegisterIndex();
+  RegisterSearch();
   RegisterStats();
   RegisterErrorHandling();
 }
@@ -121,7 +127,56 @@ void ApiServer::RegisterIndex() {
   });
 }
 
-void ApiServer::RegisterSearch() {}
+void ApiServer::RegisterSearch() {
+  server_.Post("/api/search", [this](const httplib::Request& req,
+                                     httplib::Response& res) {
+    try {
+      const auto start = std::chrono::steady_clock::now();
+      nlohmann::json body = nlohmann::json::parse(req.body, nullptr, false);
+      if (!body.is_object()) {
+        SetError(res, 400, "Invalid JSON");
+        return;
+      }
+      auto query_it = body.find("query");
+      if (query_it == body.end() || !query_it->is_string() ||
+          IsBlank(query_it->get_ref<const std::string&>())) {
+        SetError(res, 400, "Field 'query' must be a non-empty string");
+        return;
+      }
+      auto mode_it = body.find("mode");
+      if (mode_it == body.end() || !mode_it->is_string() ||
+          mode_it->get_ref<const std::string&>() != "keyword") {
+        SetError(res, 400, "Field 'mode' must be 'keyword'");
+        return;
+      }
+
+      // The original query text goes to the LLM unchanged (PD Section 8.1).
+      const QueryExpansion expansion =
+          service_->ExpandQuery(query_it->get<std::string>());
+      const KeywordSearchOutcome outcome =
+          service_->RunKeywordSearch(expansion);
+
+      nlohmann::json results = nlohmann::json::array();
+      for (const SearchResult& r : outcome.results) {
+        results.push_back(
+            {{"doc_id", r.doc_id}, {"score", r.score}, {"snippet", r.snippet}});
+      }
+      const int64_t total_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count();
+      nlohmann::json out = {{"results", std::move(results)},
+                            {"time_ms", total_ms}};
+      res.set_content(DumpJson(out), "application/json");
+    } catch (const std::exception& e) {
+      Logger::Instance().Error(std::string("POST /api/search failed: ") +
+                               e.what());
+      SetError(res, 500, "Internal server error");
+    } catch (...) {
+      SetError(res, 500, "Internal server error");
+    }
+  });
+}
 
 void ApiServer::RegisterStats() {
   server_.Get("/api/stats", [this](const httplib::Request&,
