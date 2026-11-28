@@ -307,6 +307,72 @@ void CheckSubmitResultAndException() {
   }
 }
 
+// Property 4: an exception from an enqueue() task does not stop the pool
+// (Requirement 4.10). Any subset of tasks throws (std and non-std types); all
+// non-throwing tasks still run, and the pool keeps accepting new tasks.
+void CheckEnqueueExceptionsKeepPoolAlive() {
+  using search_engine::ThreadPool;
+  for (uint32_t seed : kSeeds) {
+    std::mt19937 rng = MakeRng(seed);
+    const size_t workers = static_cast<size_t>(RandomInt(rng, 1, 8));
+    const int n = RandomInt(rng, 20, 300);
+    ThreadPool pool(workers, 0);
+
+    std::atomic<int> ok_ran{0};
+    std::atomic<int> throwing_ran{0};
+    int expected_ok = 0;
+    bool all_accepted = true;
+    for (int i = 0; i < n; ++i) {
+      const int kind = RandomInt(rng, 0, 3);  // 0,1: ok; 2: std; 3: non-std.
+      if (kind <= 1) {
+        ++expected_ok;
+        all_accepted &= pool.enqueue([&] { ++ok_ran; });
+      } else if (kind == 2) {
+        all_accepted &= pool.enqueue([&] {
+          ++throwing_ran;
+          throw std::runtime_error("boom");
+        });
+      } else {
+        all_accepted &= pool.enqueue([&] {
+          ++throwing_ran;
+          throw 7;
+        });
+      }
+    }
+    Check(all_accepted, "enqueue-exc: all tasks accepted");
+
+    // Pool still accepts and runs new tasks once the batch has been handled.
+    std::promise<void> done;
+    std::future<void> done_future = done.get_future();
+    // Wait for the batch: tasks are FIFO, but several workers run concurrently,
+    // so poll the counters before submitting the probe.
+    while (ok_ran.load() + throwing_ran.load() < n) std::this_thread::yield();
+    Check(pool.enqueue([&] { done.set_value(); }),
+          "enqueue-exc: enqueue after exceptions returns true");
+    done_future.get();
+
+    // Every worker must still be alive: block `workers` tasks on a barrier
+    // that only opens when all of them run simultaneously.
+    std::atomic<size_t> arrived{0};
+    std::promise<void> all_here;
+    std::shared_future<void> all_here_future = all_here.get_future().share();
+    std::atomic<size_t> finished{0};
+    for (size_t i = 0; i < workers; ++i) {
+      Check(pool.enqueue([&] {
+        if (++arrived == workers) all_here.set_value();
+        all_here_future.wait();
+        ++finished;
+      }),
+            "enqueue-exc: barrier task accepted");
+    }
+    pool.shutdown();
+    Check(finished.load() == workers,
+          "enqueue-exc: all workers survived throwing tasks");
+    Check(ok_ran.load() == expected_ok,
+          "enqueue-exc: every non-throwing task ran");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -314,6 +380,7 @@ int main() {
   CheckBoundedQueueLimit();
   CheckShutdownDrainsAndJoins();
   CheckSubmitResultAndException();
+  CheckEnqueueExceptionsKeepPoolAlive();
   if (FailureCount() != 0) {
     Log("index_stress_test: " + std::to_string(FailureCount()) + " failure(s)");
     return 1;
