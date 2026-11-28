@@ -11,7 +11,7 @@ participant "Ollama\n(/api/generate)" as Llm
 participant "InvertedIndex\n(знімок)" as Idx
 participant "StripedHashTable\n(shared_mutex стрипа)" as Tbl
 participant "Ranker" as Rank
-
+participant "Файли корпусу\n(DATASET_DIR)" as Fs
 Cli -> Api : POST /api/search\n{"query": "...", "mode": "keyword"}
 note right of Api
   З'єднання обслуговує окремий потік request_pool
@@ -55,11 +55,22 @@ else валідний запит
     note right of Tbl : shared_lock на один стрип,\nкопія списку постингів
     Tbl --> Rank : postings (df = size)
   end
-  Rank -> Idx : Documents().Get(doc_id) для snippet
-  Rank --> Svc : top-k за score
+  Rank --> Svc : vector<RankedDocument>\n(doc_index, score, anchor_offset, anchor_term)
+  note over Svc, Tbl : Усі shared_lock на стрипи вже відпущено
+  Svc -> Svc : AttachSnippets(dataset_dir, *index, ranked)
+  loop кожен документ із top-k (поза будь-якими блокуваннями)
+    Svc -> Idx : Documents().Get(doc_index)\n(relative_path, статичний snippet)
+    Svc -> Fs : BuildKwicSnippet(path, anchor_offset, anchor_term)\nвідкрити файл, прочитати вікно ±100 байтів
+    alt за зсувом стоїть anchor_term
+      Fs --> Svc : KWIC-snippet (≤ 160 байтів, "..." по краях)
+    else файл недоступний, коротший або термін не збігся
+      Fs --> Svc : std::nullopt
+      Svc -> Svc : резервний статичний snippet з DocumentInfo
+    end
+  end
   Svc --> Api : KeywordSearchOutcome
-  Api -> Api : time_ms = повний час від t0 (expansion + пошук)
-  Api --> Cli : 200 {"results": [{doc_id, score, snippet}], "time_ms": T}
+  Api -> Api : time_ms = повний час від t0\n(expansion + пошук + читання вікон)
+  Api --> Cli : 200 {"results": [{doc_id, score, snippet} (без title)], "time_ms": T}
 end
 note over Cli, Api
   Той самий пайплайн, що в UC-2, але одна відповідь

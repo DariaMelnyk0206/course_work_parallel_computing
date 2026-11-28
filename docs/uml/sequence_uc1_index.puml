@@ -2,7 +2,6 @@
 title UC-1: Index the corpus (POST /api/index)
 skinparam shadowing false
 skinparam sequenceMessageAlign center
-
 actor "Web UI / CLI" as Client
 participant "ApiServer\n(request_pool thread)" as Api
 participant SearchService as Svc
@@ -11,7 +10,6 @@ participant "index_pool\n(ThreadPool, N)" as Pool
 participant "Worker i\n(index_pool thread)" as Worker
 participant StripedHashTable as Table
 participant DocumentTable as Docs
-
 Client -> Api : POST /api/index {"threads": N}
 activate Api
 Api -> Api : validate JSON and 'threads' (1..256)
@@ -29,13 +27,13 @@ Svc -> Builder : Build(dataset_dir, N)
 activate Builder
 Builder -> Builder : start steady_clock timer
 Builder -> Builder : scan dataset, sort file list\n(sequential part)
+Builder -> Builder : if dataset_dir/metadata.csv exists:\nParseMetadataLine per row -> id to "title (year)" map\n(sequential part; else log Info, titles empty)
 Builder -> Table : create new StripedHashTable
 Builder -> Docs : allocate slots[file_count]\n(before any task starts)
 Builder -> Pool : create ThreadPool(N), unbounded queue
 loop for each file
   Builder -> Pool : Submit(task(doc_id)) -> future
 end
-
 par one task per file, running on index_pool workers
   Pool -> Worker : run task(doc_id)
   activate Worker
@@ -44,23 +42,22 @@ par one task per file, running on index_pool workers
     Worker -> Worker : log warning, skip\n(slot stays valid=false, not counted)
   end
   Worker -> Worker : MakeSnippet(content)
-  Worker -> Worker : tokenize into local unordered_set\n(local aggregation, no locks)
+  Worker -> Worker : TokenizeWithOffsets into local\nunordered_map term -> first offset\n(local aggregation, no locks)
   Worker -> Worker : FNV-1a hash per term,\ngroup terms by stripe
   loop for each stripe with terms
     Worker -> Table : InsertBatch(stripe, items)
     activate Table
     Table -> Table : unique_lock(stripe mutex)
-    Table -> Table : append doc_id to postings
+    Table -> Table : append Posting{doc_id, offset} to postings
     Table -> Table : unlock
     Table --> Worker
     deactivate Table
   end
-  Worker -> Docs : write DocumentInfo into own slot[doc_id]\n(no lock)
+  Worker -> Docs : write DocumentInfo (name, relative_path,\ntitle, snippet) into own slot[doc_id]\n(no lock)
   Worker -> Worker : indexed_count.fetch_add(1)
   Worker --> Pool : future ready
   deactivate Worker
 end
-
 Builder -> Pool : future.get() for every task\n(happens-before)
 Builder -> Pool : destroy index_pool (shutdown, join)
 Builder -> Builder : log documents and UniqueTermCount()
@@ -68,14 +65,12 @@ Builder -> Builder : make_shared<const InvertedIndex>(table, docs, count)
 Builder -> Builder : stop timer, time_ms
 Builder --> Svc : IndexBuildResult(documents, time_ms)
 deactivate Builder
-
 Svc -> Svc : PublishIndex: lock(index_mutex_), swap shared_ptr<const InvertedIndex>,\nupdate stats (documents, time, threads_used = N), unlock
 Svc -> Svc : ~IndexingGuard: indexing_in_progress_ = false\n(also on exception)
 Svc --> Api : IndexOutcome::kOk
 deactivate Svc
 Api --> Client : 200 {"status": "ok", "documents_indexed": D, "time_ms": T}
 deactivate Api
-
 note over Client, Docs
   Searches running during the build keep using the old snapshot.
   A search started after publication sees the new index.
