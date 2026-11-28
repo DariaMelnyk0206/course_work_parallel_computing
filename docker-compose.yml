@@ -1,0 +1,51 @@
+services:
+  ollama:
+    image: ollama/ollama:0.40.19
+    volumes: ["ollama_data:/root/.ollama"]
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_NUM_PARALLEL=1   # Ollama also serves one request at a time.
+    ports: ["11434:11434"]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  ollama-init:
+    image: ollama/ollama:0.40.19
+    depends_on:
+      ollama: { condition: service_healthy }
+    environment: ["OLLAMA_HOST=ollama:11434"]
+    entrypoint: ["/bin/sh", "-c", "ollama pull ${OLLAMA_MODEL:-qwen2.5:1.5b} && ollama run ${OLLAMA_MODEL:-qwen2.5:1.5b} 'warmup'"]
+    restart: "no"
+
+  search-server:
+    build: { context: ., dockerfile: Dockerfile, target: runtime }
+    ports: ["8080:8080"]
+    environment:
+      - PORT=8080
+      - DATASET_DIR=/app/dataset
+      - WEB_DIR=/app/web
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:1.5b}
+      - LLM_TIMEOUT_MS=5000
+      - EXPANSION=${EXPANSION:-on}
+      - REQUEST_THREADS=64
+      - REQUEST_QUEUE=128
+      - MAX_INDEX_THREADS=256
+      - TOP_K=20
+    volumes: ["${DATASET_PATH:-./dataset}:/app/dataset:ro"]
+    depends_on:
+      ollama: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "search", "--health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
