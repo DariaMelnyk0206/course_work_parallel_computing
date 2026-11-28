@@ -12,13 +12,16 @@ namespace search_engine {
 // Registers REST and WebSocket routes on an httplib::Server and applies the
 // server settings from PD Section 10.2 (keep-alive, payload limit, WS read
 // timeout). The request_pool is not a field: httplib owns it through the
-// new_task_queue factory installed in Listen() (see task 3.1).
+// new_task_queue factory installed in the constructor (see task 3.1).
 class ApiServer {
  public:
   ApiServer(Config config, std::shared_ptr<SearchService> service);
 
   // Blocks until the server stops (Requirement 5.1).
   bool Listen();
+
+  // Stops the server; makes Listen() return. Safe to call from any thread.
+  void Stop();
 
  private:
   void RegisterHealth();         // GET /api/health (Requirement 14).
