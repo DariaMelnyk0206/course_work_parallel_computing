@@ -50,7 +50,7 @@ add_library(search_core STATIC
   src/config.cc src/logger.cc src/tokenizer.cc
   src/striped_hash_table.cc src/document_table.cc src/inverted_index.cc
   src/snippet.cc src/ranker.cc src/ollama_client.cc
-  src/index_builder.cc src/search_service.cc)
+  src/index_builder.cc src/search_service.cc src/api_server.cc)
 target_include_directories(search_core PUBLIC src)
 target_link_libraries(search_core PUBLIC
   search_build_options httplib::httplib nlohmann_json::nlohmann_json)
