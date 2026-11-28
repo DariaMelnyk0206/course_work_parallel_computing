@@ -1,11 +1,80 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="uk">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Search Engine</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
 </head>
 <body>
-  <h1>Search Engine</h1>
-  <p>Web UI placeholder.</p>
+  <header class="topbar">
+    <h1>Search Engine</h1>
+    <div class="status-group">
+      <span class="indicator" id="server-indicator" data-state="unknown">
+        <span class="dot"></span><span class="label">Сервер:</span>
+        <span class="value" id="server-status">невідомо</span>
+      </span>
+      <span class="indicator" id="ollama-indicator" data-state="unknown">
+        <span class="dot"></span><span class="label">Ollama:</span>
+        <span class="value" id="ollama-status">невідомо</span>
+      </span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" id="stats-panel">
+      <h2>Статистика</h2>
+      <dl class="stats">
+        <div><dt>Документів</dt><dd id="stat-documents">0</dd></div>
+        <div><dt>Час побудови індексу, мс</dt><dd id="stat-build-time">0</dd></div>
+        <div><dt>Потоків</dt><dd id="stat-threads">0</dd></div>
+      </dl>
+    </section>
+
+    <section class="panel" id="index-panel">
+      <h2>Індексація</h2>
+      <form id="index-form" class="row">
+        <label for="index-threads">Кількість потоків</label>
+        <input id="index-threads" type="number" min="1" max="256" step="1" value="4">
+        <button type="submit" id="index-button">Індексувати</button>
+      </form>
+      <p id="index-result" class="result-text" aria-live="polite"></p>
+    </section>
+
+    <section class="panel" id="search-panel">
+      <h2>Пошук</h2>
+      <form id="search-form" class="row">
+        <input id="search-query" type="text" placeholder="Введіть запит" autocomplete="off">
+        <button type="submit" id="search-button">Шукати</button>
+      </form>
+
+      <ol class="pipeline" id="pipeline">
+        <li class="stage" id="stage-query_expansion" data-state="pending">
+          <span class="stage-name">query_expansion</span>
+          <span class="stage-state">очікування</span>
+          <span class="stage-time"></span>
+        </li>
+        <li class="stage" id="stage-keyword_search" data-state="pending">
+          <span class="stage-name">keyword_search</span>
+          <span class="stage-state">очікування</span>
+          <span class="stage-time"></span>
+        </li>
+        <li class="stage" id="stage-done" data-state="pending">
+          <span class="stage-name">done</span>
+          <span class="stage-state">очікування</span>
+          <span class="stage-time"></span>
+        </li>
+      </ol>
+
+      <div id="error-area" class="error" role="alert"></div>
+
+      <h3>Розширені терміни</h3>
+      <ul id="terms-list" class="terms"></ul>
+
+      <h3>Результати</h3>
+      <ol id="results-list" class="results"></ol>
+    </section>
+  </main>
 </body>
 </html>
