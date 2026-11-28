@@ -1,11 +1,26 @@
 # Local SDD / Kiro artifacts (must NOT be pushed to GitHub)
 .kiro/
 
+# Local reference documents (syllabus etc.), not part of the repository
+docs/refs/
+
 # Build & Dataset artifacts
 build/
+build-*/
 cmake-build-*/
-dataset/
+dataset/*
+!dataset/.gitkeep
 *.o
 *.a
 *.out
 .DS_Store
+
+# IDE files
+.vscode/
+.idea/
+
+# Python virtual environments and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
