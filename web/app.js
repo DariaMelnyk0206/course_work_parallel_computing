@@ -145,6 +145,14 @@ function renderTerms(terms) {
   }
 }
 
+// Shows "Показано N з M" above the results; empty when there is no summary.
+function renderSummary(shown, total) {
+  if (shown === null || total === null) {
+    setText(dom.resultsSummary, "");
+    return;
+  }
+  setText(dom.resultsSummary, "Показано " + shown + " з " + total);
+}
 function renderResults(results) {
   dom.resultsList.replaceChildren();
   for (const result of results) {
@@ -169,6 +177,7 @@ function resetPipeline() {
   }
   renderTerms([]);
   renderResults([]);
+  renderSummary(null, null);
   showError("");
 }
 
@@ -199,7 +208,14 @@ function handleMessage(message) {
     case "keyword_search":
       setStage("keyword_search", "done", data.time_ms);
       setStage("done", "running");
-      renderResults(Array.isArray(data.results) ? data.results : []);
+      {
+        const results = Array.isArray(data.results) ? data.results : [];
+        renderResults(results);
+        const total = Number.isInteger(data.total_matches)
+                          ? data.total_matches
+                          : results.length;
+        renderSummary(results.length, total);
+      }
       break;
     case "done":
       setStage("done", "done", data.total_time_ms);
@@ -294,6 +310,7 @@ function init() {
   dom.errorArea = document.getElementById("error-area");
   dom.termsList = document.getElementById("terms-list");
   dom.resultsList = document.getElementById("results-list");
+  dom.resultsSummary = document.getElementById("results-summary");
 
   dom.searchForm.addEventListener("submit", (event) => {
     event.preventDefault();

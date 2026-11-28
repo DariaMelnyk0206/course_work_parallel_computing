@@ -154,3 +154,4 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
 .results .doc-id { font-weight: 600; font-family: ui-monospace, Menlo, Consolas, monospace; }
 .results .score { margin-left: 8px; color: var(--muted); font-size: 0.9rem; }
 .results .snippet { margin: 2px 0 0; color: var(--text); overflow-wrap: anywhere; }
+#results-summary { margin: 0 0 8px; color: var(--muted); font-size: 0.9rem; }
