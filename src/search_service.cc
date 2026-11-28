@@ -1,8 +1,12 @@
 #include "search_service.h"
 
+#include <cstddef>
+#include <unordered_set>
 #include <utility>
 
 #include "index_builder.h"
+#include "striped_hash_table.h"
+#include "tokenizer.h"
 
 namespace search_engine {
 
@@ -50,17 +54,53 @@ IndexOutcome SearchService::BuildIndex(int num_threads,
   return IndexOutcome::kOk;
 }
 
-// Stub: returns an empty expansion.
 QueryExpansion SearchService::ExpandQuery(const std::string& query) {
-  (void)query;
-  return {};
+  QueryExpansion expansion;
+
+  // Unique original terms in order of appearance.
+  std::unordered_set<std::string> seen;
+  for (std::string& token : Tokenizer::Tokenize(query)) {
+    if (seen.insert(token).second)
+      expansion.original_terms.push_back(std::move(token));
+  }
+
+  if (config_.expansion_enabled) {
+    // No index lock is held while waiting for the LLM (Requirement 15.7).
+    ExpansionResult llm =
+        ollama_client_.Expand(query, expansion.original_terms);
+    expansion.new_terms = std::move(llm.new_terms);
+    expansion.used_fallback = llm.used_fallback;
+  }
+
+  expansion.expanded_terms = expansion.original_terms;
+  expansion.expanded_terms.insert(expansion.expanded_terms.end(),
+                                  expansion.new_terms.begin(),
+                                  expansion.new_terms.end());
+
+  expansion.weighted_terms.reserve(expansion.expanded_terms.size());
+  for (size_t i = 0; i < expansion.expanded_terms.size(); ++i) {
+    const std::string& term = expansion.expanded_terms[i];
+    const double weight = i < expansion.original_terms.size() ? 2.0 : 1.0;
+    expansion.weighted_terms.push_back(
+        {term, StripedHashTable::Fnv1aHash64(term), weight});
+  }
+  return expansion;
 }
 
-// Stub: returns empty results.
 KeywordSearchOutcome SearchService::RunKeywordSearch(
     const QueryExpansion& expansion) {
-  (void)expansion;
-  return {};
+  KeywordSearchOutcome outcome;
+  const auto start = std::chrono::steady_clock::now();
+  std::shared_ptr<const InvertedIndex> index = CurrentIndex();
+  if (index != nullptr && !expansion.weighted_terms.empty()) {
+    outcome.results =
+        Ranker::Rank(expansion.weighted_terms, *index, config_.top_k);
+  }
+  outcome.search_time_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count();
+  return outcome;
 }
 
 IndexStats SearchService::Stats() const {
