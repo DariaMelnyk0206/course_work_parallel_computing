@@ -188,11 +188,49 @@ void CheckBoundedQueueLimit() {
   }
 }
 
+// Property 2: shutdown() drains and joins (Requirements 4.6, 4.7). After
+// shutdown() returns, all N queued tasks have run, enqueue() is rejected, and
+// a repeated shutdown() (as from the destructor) is a harmless no-op. Workers
+// being joined is observed indirectly: the counter no longer changes after
+// shutdown() returns, so no worker is still running tasks.
+void CheckShutdownDrainsAndJoins() {
+  using search_engine::ThreadPool;
+  for (uint32_t seed : kSeeds) {
+    std::mt19937 rng = MakeRng(seed);
+    const size_t workers = static_cast<size_t>(RandomInt(rng, 1, 8));
+    const size_t n = static_cast<size_t>(RandomInt(rng, 0, 500));
+    const size_t capacity = RandomInt(rng, 0, 1) == 0 ? 0 : n + 1;
+
+    std::atomic<size_t> executed{0};
+    {
+      ThreadPool pool(workers, capacity);
+      bool all_accepted = true;
+      for (size_t i = 0; i < n; ++i) {
+        all_accepted &= pool.enqueue([&] {
+          std::this_thread::yield();
+          ++executed;
+        });
+      }
+      Check(all_accepted, "shutdown: all tasks accepted before shutdown");
+      pool.shutdown();
+      Check(executed.load() == n, "shutdown: all queued tasks executed");
+      Check(!pool.enqueue([&] { ++executed; }),
+            "shutdown: enqueue after shutdown is false");
+      pool.shutdown();  // Second call must not block or change anything.
+      pool.shutdown();
+      std::this_thread::yield();
+      Check(executed.load() == n, "shutdown: no task runs after shutdown");
+    }  // Destructor calls shutdown() a further time.
+    Check(executed.load() == n, "shutdown: counter unchanged after destructor");
+  }
+}
+
 }  // namespace
 
 int main() {
   CheckHarness();
   CheckBoundedQueueLimit();
+  CheckShutdownDrainsAndJoins();
   if (FailureCount() != 0) {
     Log("index_stress_test: " + std::to_string(FailureCount()) + " failure(s)");
     return 1;
