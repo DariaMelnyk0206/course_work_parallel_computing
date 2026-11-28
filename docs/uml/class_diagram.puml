@@ -1,21 +1,12 @@
 @startuml class_diagram
-title Діаграма класів: архітектура (за src/*.h)
+title Діаграма класів
+top to bottom direction
 skinparam classAttributeIconSize 0
 skinparam shadowing false
+skinparam nodesep 50
+skinparam ranksep 60
+skinparam defaultFontSize 14
 hide empty members
-
-abstract class "httplib::TaskQueue" as TaskQueue {
-  {abstract} +enqueue(fn)
-  {abstract} +shutdown()
-}
-
-class Config <<struct>> {
-  +port, dataset_dir, web_dir
-  +ollama_host, ollama_model
-  +llm_timeout_ms, expansion_enabled
-  +request_threads, request_queue, top_k
-  +{static} FromEnvironment()
-}
 
 class ApiServer {
   -config_
@@ -25,27 +16,40 @@ class ApiServer {
 }
 
 class SearchService {
-  -index_mutex_
+  -index_mutex_ : mutex
   -index_ : shared_ptr<const InvertedIndex>
   -indexing_in_progress_ : atomic<bool>
-  +BuildIndex(num_threads, ...)
+  +BuildIndex(n)
   +ExpandQuery(query)
   +RunKeywordSearch(expansion)
   +Stats()
-  +OllamaAvailable()
+}
+
+class OllamaClient {
+  -generate_mutex_ : timed_mutex
+  +Expand(query, terms)
+  +IsAvailable()
+}
+
+class IndexBuilder {
+  +{static} Build(dir, n)
+}
+
+class Ranker {
+  +{static} Rank(terms, index, top_k)
 }
 
 class ThreadPool <<final>> {
   -workers_ : vector<jthread>
-  -tasks_, mutex_, cv_
+  -tasks_ : queue
   +enqueue(fn)
   +shutdown()
   +Submit(task)
 }
 
-class IndexBuilder {
-  +{static} Build(dataset_dir, num_threads)
-  +{static} ParseMetadataLine(line)
+abstract class "httplib::TaskQueue" as TaskQueue {
+  {abstract} +enqueue(fn)
+  {abstract} +shutdown()
 }
 
 class InvertedIndex {
@@ -55,59 +59,64 @@ class InvertedIndex {
 }
 
 class StripedHashTable {
+  -buckets_ : vector<vector<Entry>>
+  -stripes_ : vector<shared_mutex>
   +InsertBatch(stripe, items)
   +Lookup(term, hash)
   +{static} Fnv1aHash64(term)
 }
 
 class DocumentTable {
-  +Set(doc_id, info)
-  +Get(doc_id)
+  -documents_ : vector<DocumentInfo>
+  +Set()
+  +Get()
 }
 
-class Ranker {
-  +{static} Rank(terms, index, top_k, ...)
+class "StripedHashTable::Entry" as Entry <<struct>> {
+  term
+  postings : vector<Posting>
 }
 
-class OllamaClient {
-  -generate_mutex_ : timed_mutex
-  +Expand(original_query, original_terms)
-  +IsAvailable()
+class Posting <<struct>> {
+  doc_id
+  offset
 }
 
-class Tokenizer {
-  +{static} Tokenize(text)
-  +{static} TokenizeWithOffsets(text)
+class DocumentInfo <<struct>> {
+  name
+  relative_path
+  title
+  snippet
+  valid
 }
 
-TaskQueue <|-- ThreadPool
-
-ApiServer ..> ThreadPool : «створює через new_task_queue»\n(request_pool; власник — httplib)
-IndexBuilder ..> ThreadPool : «створює» index_pool
-
-ApiServer *-- Config
-ApiServer o-- SearchService : shared_ptr
-SearchService *-- Config
+ApiServer o-- SearchService
 SearchService *-- OllamaClient
-SearchService o-- "0..1" InvertedIndex : поточний знімок\n(shared_ptr<const>)
+SearchService ..> IndexBuilder
+SearchService ..> Ranker
+SearchService o-- InvertedIndex : знімок
+ApiServer ..> ThreadPool : «створює request_pool»
+IndexBuilder ..> ThreadPool : «створює index_pool»
+IndexBuilder ..> InvertedIndex : «будує»
+Ranker ..> InvertedIndex : «Lookup»
+ThreadPool --|> TaskQueue
 InvertedIndex *-- StripedHashTable
 InvertedIndex *-- DocumentTable
+StripedHashTable *-- "0..*" Entry
+Entry *-- "0..*" Posting
+DocumentTable *-- "0..*" DocumentInfo
 
-SearchService ..> IndexBuilder : Build → IndexBuildResult
-SearchService ..> Ranker : Rank → RankedDocument
-SearchService ..> Tokenizer
-IndexBuilder ..> InvertedIndex : «створює»
-IndexBuilder ..> Tokenizer
-Ranker ..> InvertedIndex : Lookup
-OllamaClient ..> Tokenizer : розбір відповіді\n→ ExpansionResult
+OllamaClient -[hidden]right- IndexBuilder
+IndexBuilder -[hidden]right- Ranker
+SearchService -[hidden]down- IndexBuilder
 
-note bottom of SearchService
-  ExpandQuery повертає QueryExpansion,
-  RunKeywordSearch повертає KeywordSearchOutcome,
-  Stats повертає IndexStats (лише типи результатів).
+note right of StripedHashTable
+  бакет = h & (B−1), стрип = бакет & (S−1);
+  запис — unique_lock, читання — shared_lock
 end note
 
 note as N1
-  Logger (singleton) використовується всіма компонентами.
+  Config, Tokenizer, Logger
+  використовуються кількома компонентами
 end note
 @enduml

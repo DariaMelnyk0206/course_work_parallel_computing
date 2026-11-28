@@ -388,7 +388,7 @@ python3 scripts/benchmark.py throughput
 Діаграми PlantUML лежать у `docs/uml/` (`*.puml`) разом із відрендереними `*.png`:
 
 - `use_case` — прецеденти;
-- `class_diagram` — архітектура (ключові класи та зв'язки), `class_index_structure` — структура даних індексу;
+- `class_diagram` — діаграма класів (архітектура та структура даних індексу);
 - `sequence_uc1_index` … `sequence_uc5_health` — по одній діаграмі послідовності на кожен прецедент;
 - `deployment` — розгортання Docker Compose.
 

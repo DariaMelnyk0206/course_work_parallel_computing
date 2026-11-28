@@ -2,50 +2,34 @@
 title UC-1: Індексація корпусу (POST /api/index)
 skinparam shadowing false
 skinparam sequenceMessageAlign center
-actor "Клієнт\n(Web UI / CLI)" as Client
-participant "ApiServer\n(потік request_pool)" as Api
-participant SearchService as Svc
-participant IndexBuilder as Builder
-participant "Воркер\n(потік index_pool)" as Worker
-participant StripedHashTable as Table
-participant DocumentTable as Docs
-
-Client -> Api : POST /api/index {"threads": N}
-Api -> Api : валідація JSON і threads (1..256)
-alt невалідний запит
-  Api --> Client : 400 {"error": "..."}
-else валідний запит
-  Api -> Svc : BuildIndex(N)
-  Svc -> Svc : indexing_in_progress_.compare_exchange_strong(false → true)
-  alt індексація вже виконується
-    Svc --> Api : kAlreadyInProgress
-    Api --> Client : 409 {"error": "Indexing already in progress"}
-  else прапорець захоплено
-    Svc -> Builder : Build(dataset_dir, N)
-    note over Builder : Послідовна частина (закон Амдала)
-    Builder -> Builder : старт таймера, сканування і сортування файлів
-    Builder -> Builder : завантаження назв із metadata.csv (якщо є)
-    Builder -> Table : створити StripedHashTable
-    Builder -> Docs : виділити слоти [кількість файлів]
-    Builder -> Builder : створити index_pool(N), одна задача на файл
-    par задачі воркерів index_pool (по одній на файл)
-      Builder -> Worker : Submit(задача doc_id) → future
-      Worker -> Worker : читання файлу, snippet, токенізація зі зсувами,\nFNV-1a, групування за стрипами
-      note right of Worker : локальна агрегація, без блокувань
-      loop кожен стрип із термінами
-        Worker -> Table : InsertBatch(stripe, items)
-        note right of Table : unique_lock на стрип\n(не більше одного одночасно)
-      end
-      Worker -> Docs : запис DocumentInfo у свій слот (без блокувань)
-      Worker -> Worker : лічильник документів fetch_add(1)
-    end
-    Builder -> Builder : future.get() для кожної задачі,\nзнищення index_pool
-    Builder -> Builder : make_shared<const InvertedIndex>, зупинка таймера
-    Builder --> Svc : IndexBuildResult
-    Svc -> Svc : публікація знімка під index_mutex_\n(заміна shared_ptr, оновлення статистики)
-    Svc --> Api : kOk
-    Api --> Client : 200 {"status": "ok", "documents_indexed", "time_ms"}
+skinparam defaultFontSize 14
+skinparam maxMessageSize 260
+actor "Клієнт" as C
+participant "ApiServer [request_pool]" as A
+participant SearchService as S
+participant IndexBuilder as B
+participant "Воркер [index_pool]" as W
+participant StripedHashTable as T
+C -> A : POST /api/index {"threads": N}
+note right of A : threads не ціле або поза 1..256 → 400
+A -> S : BuildIndex(N) [CAS прапорця]
+alt індексація вже триває
+  S --> A : kAlreadyInProgress
+  A --> C : 409
+else прапорець захоплено
+  S -> B : Build(dir, N)
+  B -> B : сканування файлів, metadata.csv
+  loop для кожного файлу
+    B -> W : Submit(файл)
   end
+  par воркери паралельно
+    W -> W : читання, токенізація зі зсувами,\nлокальна агрегація (без блокувань)
+    W -> T : InsertBatch(stripe) [unique_lock]
+  end
+  B -> B : future.get() для всіх задач
+  B --> S : новий індекс
+  S -> S : публікація знімка [index_mutex_]
+  S --> A : documents_indexed, time_ms
+  A --> C : 200 {"status", "documents_indexed", "time_ms"}
 end
-note over Client, Docs : Пошук під час побудови використовує старий знімок
 @enduml

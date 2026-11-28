@@ -1,34 +1,25 @@
 @startuml sequence_uc2_ws_search
 title UC-2: Пошук зі стрімінгом етапів (WS /ws/search)
 skinparam shadowing false
-skinparam responseMessageBelowArrow true
-actor "Користувач" as U
-participant "Web UI" as UI
-participant "ApiServer\n(потік request_pool)" as Api
-participant SearchService as Svc
-participant OllamaClient as Oc
-participant Ollama as Llm
-participant Ranker as Rank
-participant "Індекс" as Idx
-
-U -> UI : вводить запит
-UI -> Api : WebSocket connect /ws/search
-note right of Api : Потік request_pool обслуговує всю WS-сесію
-UI -> Api : {"query": "..."}
-Api -> Api : t0 = steady_clock::now(), валідація JSON і query
-alt невалідний JSON або порожній query
-  Api --> UI : {"stage": "error", "data": {"message": "..."}}
-  Api -> UI : close(1008)
-else запит коректний
-  == Етап 1: query_expansion ==
-  ref over Api, Llm : Розширення запиту (UC-3):\nExpandQuery → Tokenize, try_lock_for(LLM_TIMEOUT_MS),\nPOST /api/generate або fallback
-  Api --> UI : {"stage": "query_expansion", "data": {original, expanded_terms}}
-  == Етап 2: keyword_search ==
-  ref over Api, Idx : Пошук за ключовими словами (UC-3):\nRank → Lookup під shared_lock, KWIC-вікна для top-k
-  Api --> UI : {"stage": "keyword_search", "data": {results, time_ms, total_matches}}
-  == Етап 3: done ==
-  Api --> UI : {"stage": "done", "data": {total_time_ms}}
-  note right of UI : З'єднання лишається відкритим для наступного запиту
-end
-UI -> U : показує етапи, expanded_terms і результати
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 14
+skinparam maxMessageSize 260
+actor "Web UI" as C
+participant "ApiServer [request_pool]" as A
+participant SearchService as S
+participant OllamaClient as O
+participant "Індекс" as I
+C -> A : WS {"query"}
+A -> S : ExpandQuery(query)
+S -> O : Expand(query, terms)\n[try_lock_for, fallback при тайм-ауті]
+O --> S : expanded_terms
+S --> A : QueryExpansion
+A --> C : {"stage": "query_expansion"}
+A -> S : RunKeywordSearch(expansion)
+S -> I : Lookup(term) [shared_lock]
+I --> S : postings
+S --> A : results
+A --> C : {"stage": "keyword_search"}
+A --> C : {"stage": "done"}
+note over A : сесію обслуговує один потік request_pool;\nпомилка запиту → stage "error", close 1008
 @enduml

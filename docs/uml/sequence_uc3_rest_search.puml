@@ -1,52 +1,31 @@
 @startuml sequence_uc3_rest_search
 title UC-3: Пошук через REST (POST /api/search)
 skinparam shadowing false
-skinparam responseMessageBelowArrow true
-actor "Клієнт\n(CLI)" as Cli
-participant "ApiServer\n(потік request_pool)" as Api
-participant SearchService as Svc
-participant OllamaClient as Oc
-participant "Ollama" as Llm
-participant Ranker as Rank
-participant "Індекс\n(InvertedIndex /\nStripedHashTable)" as Idx
-
-Cli -> Api : POST /api/search {"query", "mode": "keyword"}
-Api -> Api : t0 = steady_clock::now(), валідація JSON, query, mode
-alt невалідний запит
-  Api --> Cli : 400 {"error": "..."}
-else валідний запит
-  == Розширення запиту ==
-  Api -> Svc : ExpandQuery(query)
-  Svc -> Svc : Tokenize(query) → оригінальні терміни
-  alt EXPANSION=off
-    Svc -> Svc : нові терміни = []
-  else EXPANSION=on
-    Svc -> Oc : Expand(query, original_terms)
-    Oc -> Oc : try_lock_for(LLM_TIMEOUT_MS)
-    alt успіх
-      Oc -> Llm : POST /api/generate
-      Llm --> Oc : response
-      Oc -> Oc : unlock, Tokenize(response), ≤ 10 нових термінів
-    else черга вичерпана, тайм-аут або помилка → fallback
-      Oc -> Oc : нові терміни = [], подія в лог
-    end
-    Oc --> Svc : ExpansionResult
-  end
-  Svc --> Api : QueryExpansion\n(оригінальні w=2 + нові w=1)
-  note over Svc, Idx : М'ютекс LLM звільнено, індекс під час очікування LLM не блокується
-  == Пошук за ключовими словами ==
-  Api -> Svc : RunKeywordSearch(expansion)
-  Svc -> Rank : Rank(weighted_terms, index, top_k)
-  loop кожен унікальний термін
-    Rank -> Idx : Lookup(term, hash)\n(shared_lock на стрип, копія постингів)
-    Idx --> Rank : postings
-  end
-  Rank -> Rank : IDF, нормований score, якір, сортування, top-k
-  Rank --> Svc : RankedDocument[], total_matches
-  loop кожен документ із top-k (без блокувань)
-    Svc -> Svc : KWIC-вікно ±100 байтів із файлу за зсувом якоря\n(запасний варіант: статичний snippet)
-  end
-  Svc --> Api : KeywordSearchOutcome
-  Api --> Cli : 200 {"results": [{doc_id, score, snippet}], "time_ms"}
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 14
+skinparam maxMessageSize 260
+actor "Клієнт (CLI)" as C
+participant "ApiServer [request_pool]" as A
+participant SearchService as S
+participant OllamaClient as O
+participant Ollama as L
+participant "Індекс" as I
+C -> A : POST /api/search {"query", "mode"}
+A -> S : ExpandQuery(query)
+S -> O : Expand(query, terms) [try_lock_for]
+alt успіх
+  O -> L : POST /api/generate
+  L --> O : ключові слова
+else тайм-аут або помилка
+  O --> S : fallback: лише терміни запиту
 end
+O --> S : expanded_terms
+A -> S : RunKeywordSearch(expansion)
+loop для кожного терміна
+  S -> I : Lookup(term) [shared_lock]
+  I --> S : postings
+end
+S -> S : score, top-k, KWIC-вікна з файлів
+S --> A : results
+A --> C : 200 {"results", "time_ms"}
 @enduml

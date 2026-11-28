@@ -1,28 +1,15 @@
 @startuml sequence_uc4_stats
 title UC-4: Перегляд статистики (GET /api/stats)
-skinparam responseMessageBelowArrow true
-actor "Користувач Web UI / CLI" as User
-participant "ApiServer\n(handler у потоці request_pool)" as Api
-participant "SearchService" as Svc
-participant "std::mutex\n(index_mutex_)" as Mtx
-
-User -> Api : GET /api/stats\n(Web UI: при завантаженні й після індексації; CLI: --stats)
-note right of Api
-  З'єднання обслуговує окремий потік request_pool
-end note
-Api -> Svc : Stats()
-Svc -> Mtx : lock()
-note right of Mtx
-  Короткий м'ютекс: лише копія структури IndexStats.
-  Не блокує пошук, індекс і Ollama.
-end note
-Svc -> Svc : копія IndexStats\n(documents, index_build_time_ms, threads_used)
-Svc -> Mtx : unlock()
-Svc --> Api : IndexStats
-note over Svc
-  Під час перебудови повертається статистика попереднього індексу.
-  До першої індексації: documents = 0, index_build_time_ms = 0, threads_used = 0.
-end note
-Api -> Api : серіалізація JSON
-Api --> User : 200 {"documents": D, "index_build_time_ms": T, "threads_used": N}
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 14
+skinparam maxMessageSize 260
+actor "Клієнт" as C
+participant "ApiServer [request_pool]" as A
+participant SearchService as S
+C -> A : GET /api/stats
+A -> S : Stats() [index_mutex_]
+S --> A : IndexStats
+A --> C : 200 {"documents", "index_build_time_ms", "threads_used"}
+note right of S : до першої індексації — нулі
 @enduml

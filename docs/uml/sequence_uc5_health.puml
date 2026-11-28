@@ -1,40 +1,21 @@
 @startuml sequence_uc5_health
 title UC-5: Перевірка стану (GET /api/health)
-skinparam responseMessageBelowArrow true
-actor "Користувач Web UI / CLI" as User
-participant "ApiServer\n(handler у потоці request_pool)" as Api
-participant "SearchService" as Svc
-participant "OllamaClient" as Ollama
-participant "std::timed_mutex\n(черга LLM)" as Mtx
-participant "Ollama\n(/api/tags)" as Llm
-
-User -> Api : GET /api/health
-note right of Api
-  З'єднання обслуговує окремий потік request_pool
-end note
-Api -> Svc : OllamaAvailable()
-Svc -> Ollama : IsAvailable()
-note over Ollama, Mtx
-  generate_mutex_ (timed_mutex) НЕ захоплюється:
-  перевірка не стоїть у черзі до LLM
-  і не блокується активною генерацією.
-end note
-Ollama -> Llm : GET /api/tags (timeout 1 с)
-alt Ollama відповіла 200
-  Llm --> Ollama : список моделей
-  alt OLLAMA_MODEL є у списку\n(точний збіг або model:latest)
-    Ollama --> Svc : true
-  else моделі немає у списку
-    Ollama --> Svc : false
-  end
-else недоступна / тайм-аут / помилка HTTP
-  Llm --> Ollama : помилка
-  Ollama --> Svc : false
-end
-Svc --> Api : ollama: true | false
-Api --> User : 200 {"status": "ok", "ollama": true | false}
-note over User, Api
-  Відповідь завжди 200, незалежно від стану Ollama.
-  Індекс не використовується.
-end note
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 14
+skinparam maxMessageSize 260
+actor "Клієнт" as C
+participant "ApiServer [request_pool]" as A
+participant SearchService as S
+participant OllamaClient as O
+participant Ollama as L
+C -> A : GET /api/health
+A -> S : OllamaAvailable()
+S -> O : IsAvailable()
+O -> L : GET /api/tags (тайм-аут 1 с)
+L --> O : список моделей
+O --> S : bool
+S --> A : bool
+A --> C : 200 {"status", "ollama"}
+note over O : черга LLM не використовується;\nвідповідь завжди 200
 @enduml

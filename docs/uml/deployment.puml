@@ -3,15 +3,16 @@ title Діаграма розгортання (Docker Compose)
 skinparam shadowing false
 skinparam componentStyle rectangle
 left to right direction
-skinparam nodesep 60
-skinparam ranksep 70
+skinparam nodesep 80
+skinparam ranksep 110
+skinparam defaultFontSize 14
 
 node "Хост: клієнти (поза Docker Compose)" as Clients {
   artifact "Web UI\n(браузер)" as Browser
   artifact "CLI ./search\n(нативний)" as CliHost
   artifact "scripts/benchmark.py" as Bench
 }
-node "Хост (Windows + WSL2 / Linux / macOS, Docker Engine)" as Host {
+node "Windows (WSL2) / Linux / macOS, Docker Engine" as Host {
   folder "./dataset\n(або $DATASET_PATH)" as DatasetDir
 
   node "Docker Compose" as Compose {
