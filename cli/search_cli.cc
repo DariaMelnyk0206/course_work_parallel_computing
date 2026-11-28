@@ -16,6 +16,7 @@ namespace {
 
 constexpr int kDefaultTimeoutSeconds = 10;
 constexpr int kSearchTimeoutSeconds = 60;
+constexpr int kIndexTimeoutSeconds = 3600;
 
 bool ParsePositiveInt(const std::string& text, int* value) {
   if (text.empty() || text.size() > 9) {
@@ -34,29 +35,52 @@ bool ParsePositiveInt(const std::string& text, int* value) {
   return true;
 }
 
-int RunHealth(const CliOptions& options) {
+// Sends one request and returns the parsed JSON body of a 200 response.
+// Prints a message and returns false on network, HTTP or format errors.
+bool Fetch(const CliOptions& options, const std::string& method,
+           const std::string& path, const nlohmann::json& request,
+           int timeout_seconds, nlohmann::json* body) {
   httplib::Client client(options.host);
-  client.set_connection_timeout(kDefaultTimeoutSeconds, 0);
-  client.set_read_timeout(kDefaultTimeoutSeconds, 0);
-  client.set_write_timeout(kDefaultTimeoutSeconds, 0);
-  httplib::Result res = client.Get("/api/health");
+  client.set_connection_timeout(timeout_seconds, 0);
+  client.set_read_timeout(timeout_seconds, 0);
+  client.set_write_timeout(timeout_seconds, 0);
+  httplib::Result res =
+      method == "POST"
+          ? client.Post(path,
+                        request.dump(-1, ' ', false,
+                                     nlohmann::json::error_handler_t::replace),
+                        "application/json")
+          : client.Get(path);
   if (!res) {
     std::cerr << "Error: server is unavailable at " << options.host << " ("
               << httplib::to_string(res.error()) << ")\n";
-    return 1;
+    return false;
   }
-  nlohmann::json body = nlohmann::json::parse(res->body, nullptr, false);
+  nlohmann::json parsed = nlohmann::json::parse(res->body, nullptr, false);
   if (res->status != 200) {
-    if (body.is_object() && body.contains("error") &&
-        body["error"].is_string()) {
-      std::cerr << "Error: " << body["error"].get<std::string>() << "\n";
+    if (parsed.is_object() && parsed.contains("error") &&
+        parsed["error"].is_string()) {
+      std::cerr << "Error: " << parsed["error"].get<std::string>() << "\n";
     } else {
       std::cerr << "Error: server returned HTTP " << res->status << "\n";
     }
+    return false;
+  }
+  if (!parsed.is_object()) {
+    std::cerr << "Error: unexpected response from server\n";
+    return false;
+  }
+  *body = std::move(parsed);
+  return true;
+}
+
+int RunHealth(const CliOptions& options) {
+  nlohmann::json body;
+  if (!Fetch(options, "GET", "/api/health", nullptr, kDefaultTimeoutSeconds,
+             &body)) {
     return 1;
   }
-  if (!body.is_object() || !body.contains("status") ||
-      !body["status"].is_string()) {
+  if (!body.contains("status") || !body["status"].is_string()) {
     std::cerr << "Error: unexpected response from server\n";
     return 1;
   }
@@ -66,34 +90,56 @@ int RunHealth(const CliOptions& options) {
   return 0;
 }
 
+int RunStats(const CliOptions& options) {
+  nlohmann::json body;
+  if (!Fetch(options, "GET", "/api/stats", nullptr, kDefaultTimeoutSeconds,
+             &body)) {
+    return 1;
+  }
+  if (!body.contains("documents") || !body["documents"].is_number_integer() ||
+      !body.contains("index_build_time_ms") ||
+      !body["index_build_time_ms"].is_number_integer() ||
+      !body.contains("threads_used") ||
+      !body["threads_used"].is_number_integer()) {
+    std::cerr << "Error: unexpected response from server\n";
+    return 1;
+  }
+  std::cout << "documents: " << body["documents"].get<int64_t>()
+            << "\nindex_build_time_ms: "
+            << body["index_build_time_ms"].get<int64_t>()
+            << "\nthreads_used: " << body["threads_used"].get<int64_t>()
+            << "\n";
+  return 0;
+}
+
+int RunIndex(const CliOptions& options) {
+  nlohmann::json body;
+  nlohmann::json request = {{"threads", options.index_threads}};
+  if (!Fetch(options, "POST", "/api/index", request, kIndexTimeoutSeconds,
+             &body)) {
+    return 1;
+  }
+  if (!body.contains("documents_indexed") ||
+      !body["documents_indexed"].is_number_integer() ||
+      !body.contains("time_ms") || !body["time_ms"].is_number_integer()) {
+    std::cerr << "Error: unexpected response from server\n";
+    return 1;
+  }
+  std::cout << "Indexed " << body["documents_indexed"].get<int64_t>()
+            << " documents in " << body["time_ms"].get<int64_t>() << " ms ("
+            << options.index_threads << " threads)\n";
+  return 0;
+}
+
 int RunSearch(const CliOptions& options) {
-  httplib::Client client(options.host);
-  client.set_connection_timeout(kSearchTimeoutSeconds, 0);
-  client.set_read_timeout(kSearchTimeoutSeconds, 0);
-  client.set_write_timeout(kSearchTimeoutSeconds, 0);
+  nlohmann::json body;
   nlohmann::json request = {{"query", options.query}, {"mode", "keyword"}};
-  httplib::Result res = client.Post(
-      "/api/search",
-      request.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
-      "application/json");
-  if (!res) {
-    std::cerr << "Error: server is unavailable at " << options.host << " ("
-              << httplib::to_string(res.error()) << ")\n";
+  if (!Fetch(options, "POST", "/api/search", request, kSearchTimeoutSeconds,
+             &body)) {
     return 1;
   }
-  nlohmann::json body = nlohmann::json::parse(res->body, nullptr, false);
-  if (res->status != 200) {
-    if (body.is_object() && body.contains("error") &&
-        body["error"].is_string()) {
-      std::cerr << "Error: " << body["error"].get<std::string>() << "\n";
-    } else {
-      std::cerr << "Error: server returned HTTP " << res->status << "\n";
-    }
-    return 1;
-  }
-  if (!body.is_object() || !body.contains("results") ||
-      !body["results"].is_array() || !body.contains("time_ms") ||
-      !body["time_ms"].is_number()) {
+  if (!body.contains("results") || !body["results"].is_array() ||
+      !body.contains("time_ms") || !body["time_ms"].is_number()) {
     std::cerr << "Error: unexpected response from server\n";
     return 1;
   }
@@ -160,8 +206,16 @@ int ParseArgs(int argc, char** argv, CliOptions* options) {
       has_query = true;
     }
   }
-  if (!options->show_health && !options->show_stats &&
-      options->index_threads == 0 && !has_query) {
+  int modes = static_cast<int>(options->show_health) +
+              static_cast<int>(options->show_stats) +
+              static_cast<int>(options->index_threads != 0) +
+              static_cast<int>(has_query);
+  if (modes > 1) {
+    std::cerr << "Error: choose only one of query, --health, --stats, "
+                 "--index\n";
+    return 2;
+  }
+  if (modes == 0) {
     std::cerr << "Usage: search [--host URL] [--top K] "
                  "(\"query\" | --health | --stats | --index N)\n";
     return 2;
@@ -173,11 +227,16 @@ int Run(const CliOptions& options) {
   if (options.show_health) {
     return RunHealth(options);
   }
-  if (!options.show_stats && options.index_threads == 0 &&
-      !options.query.empty()) {
+  if (options.show_stats) {
+    return RunStats(options);
+  }
+  if (options.index_threads != 0) {
+    return RunIndex(options);
+  }
+  if (!options.query.empty()) {
     return RunSearch(options);
   }
-  std::cerr << "Error: this mode is not implemented yet\n";
+  std::cerr << "Error: nothing to do\n";
   return 2;
 }
 
