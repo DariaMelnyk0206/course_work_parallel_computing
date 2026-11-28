@@ -1,0 +1,55 @@
+@startuml deployment
+title Діаграма розгортання (Docker Compose)
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+node "Хост (macOS / Linux, Docker Engine)" as Host {
+  artifact "Web UI\n(браузер)" as Browser
+  artifact "CLI ./search\n(нативний)" as CliHost
+  artifact "scripts/benchmark.py" as Bench
+  folder "./dataset\n(або $DATASET_PATH)" as DatasetDir
+
+  node "Docker Compose" as Compose {
+    node "search-server\n(build: Dockerfile, target runtime;\nrestart: unless-stopped)" as SS {
+      component "search_server\nHTTP + WS :8080" as Srv
+      component "search (CLI)\nу PATH, healthcheck: search --health" as CliCont
+      folder "/app/web" as WebDir
+      folder "/app/dataset (:ro)" as DatasetMnt
+    }
+
+    node "ollama (ollama/ollama:0.40.19)" as Ol {
+      component "Ollama API :11434\nqwen2.5:1.5b\nOLLAMA_KEEP_ALIVE=24h\nOLLAMA_NUM_PARALLEL=1\nhealthcheck: ollama list" as OlApi
+      folder "/root/.ollama" as OlDir
+    }
+
+    node "ollama-init\nollama/ollama:0.40.19\nollama pull + warmup\nrestart: no" as Init
+
+    node "tsan\nprofiles: [tsan]\nbuild target: tsan\n(clang, -fsanitize=thread)\nне стартує при docker compose up" as Tsan
+
+    database "ollama_data\n(іменований том)" as Vol
+  }
+}
+
+Browser --> Srv : HTTP / WebSocket\nlocalhost:8080
+CliHost --> Srv : REST\nlocalhost:8080
+Bench ..> Srv : REST / WS\nlocalhost:8080
+
+CliCont --> Srv : REST (127.0.0.1:8080)
+Srv --> OlApi : HTTP\nhttp://ollama:11434\n/api/generate, /api/tags
+Init --> OlApi : OLLAMA_HOST=ollama:11434\npull + warmup
+Init ..> Ol : depends_on:\nservice_healthy
+SS ..> Ol : depends_on:\nservice_started
+
+OlDir -- Vol : mount
+DatasetDir -- DatasetMnt : bind mount :ro\nDATASET_PATH, по замовч. ./dataset
+
+note bottom of Tsan
+  Запуск:
+  docker compose --profile tsan
+  run --rm tsan
+end note
+
+note bottom of Host
+  Порти хоста: 8080 -> search-server, 11434 -> ollama
+end note
+@enduml
