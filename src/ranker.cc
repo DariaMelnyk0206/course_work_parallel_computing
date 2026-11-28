@@ -11,18 +11,28 @@ namespace search_engine {
 
 namespace {
 
+// Per-query accumulator (local to one Rank call).
+struct Accumulator {
+  double numerator = 0.0;
+  double anchor_weight = -1.0;
+  uint32_t anchor_offset = 0;
+  size_t anchor_term_index = 0;  // Index into the filtered term list.
+};
+
 struct ScoredDoc {
   uint32_t doc_id;
   double score;
+  uint32_t anchor_offset;
+  size_t anchor_term_index;
 };
 
 double RoundTo4Decimals(double value) { return std::round(value * 1e4) / 1e4; }
 
 }  // namespace
 
-std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
-                                       const InvertedIndex& index, int top_k,
-                                       size_t* total_matches) {
+std::vector<RankedDocument> Ranker::Rank(const std::vector<WeightedTerm>& terms,
+                                         const InvertedIndex& index, int top_k,
+                                         size_t* total_matches) {
   if (total_matches != nullptr) *total_matches = 0;
   if (top_k <= 0 || terms.empty()) return {};
 
@@ -32,6 +42,7 @@ std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
   // counted once (Q is a set); the first occurrence wins.
   std::vector<double> term_weights;
   std::vector<std::vector<Posting>> postings;
+  std::vector<const std::string*> term_names;
   std::unordered_set<std::string> seen;
   for (const WeightedTerm& term : terms) {
     if (!seen.insert(term.term).second) continue;
@@ -41,6 +52,7 @@ std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
         std::log(1.0 + document_count / static_cast<double>(list.size()));
     term_weights.push_back(term.weight * idf);
     postings.push_back(std::move(list));
+    term_names.push_back(&term.term);
   }
 
   // Same summation order as the per-document numerator, so a document
@@ -49,18 +61,27 @@ std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
   for (double weight : term_weights) denominator += weight;
   if (denominator <= 0.0) return {};
 
-  std::unordered_map<uint32_t, double> numerators;
+  // Terms are visited in expanded_terms order; the anchor is replaced only
+  // on a strictly larger weight, so on a tie the earlier term wins.
+  std::unordered_map<uint32_t, Accumulator> accumulators;
   for (size_t i = 0; i < postings.size(); ++i) {
     for (const Posting& posting : postings[i]) {
-      numerators[posting.doc_id] += term_weights[i];
+      Accumulator& acc = accumulators[posting.doc_id];
+      acc.numerator += term_weights[i];
+      if (term_weights[i] > acc.anchor_weight) {
+        acc.anchor_weight = term_weights[i];
+        acc.anchor_offset = posting.offset;
+        acc.anchor_term_index = i;
+      }
     }
   }
 
-  if (total_matches != nullptr) *total_matches = numerators.size();
+  if (total_matches != nullptr) *total_matches = accumulators.size();
   std::vector<ScoredDoc> scored;
-  scored.reserve(numerators.size());
-  for (const auto& [doc_id, numerator] : numerators) {
-    scored.push_back({doc_id, RoundTo4Decimals(numerator / denominator)});
+  scored.reserve(accumulators.size());
+  for (const auto& [doc_id, acc] : accumulators) {
+    scored.push_back({doc_id, RoundTo4Decimals(acc.numerator / denominator),
+                      acc.anchor_offset, acc.anchor_term_index});
   }
 
   auto better = [](const ScoredDoc& a, const ScoredDoc& b) {
@@ -71,11 +92,12 @@ std::vector<SearchResult> Ranker::Rank(const std::vector<WeightedTerm>& terms,
   std::partial_sort(scored.begin(), scored.begin() + limit, scored.end(),
                     better);
 
-  std::vector<SearchResult> results;
+  std::vector<RankedDocument> results;
   results.reserve(limit);
   for (size_t i = 0; i < limit; ++i) {
-    const DocumentInfo& info = index.Documents().Get(scored[i].doc_id);
-    results.push_back({info.name, scored[i].score, info.snippet, info.title});
+    results.push_back({scored[i].doc_id, scored[i].score,
+                       scored[i].anchor_offset,
+                       *term_names[scored[i].anchor_term_index]});
   }
   return results;
 }

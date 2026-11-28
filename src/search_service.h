@@ -41,7 +41,7 @@ struct QueryExpansion {
 struct KeywordSearchOutcome {
   std::vector<SearchResult> results;
   size_t total_matches = 0;    // Documents with score > 0 before the top-k cut.
-  int64_t search_time_ms = 0;  // Index lookup + ranking only.
+  int64_t search_time_ms = 0;  // Lookup + ranking + KWIC windows.
 };
 
 // Facade over indexing, search, and stats. Owns the current index snapshot
@@ -78,6 +78,16 @@ class SearchService {
   // RunKeywordSearch sequentially and reports the total as `time_ms`
   // (Requirement 17.3).
   KeywordSearchOutcome RunKeywordSearch(const QueryExpansion& expansion);
+
+  // For each ranked candidate (top-k only) opens dataset_dir/relative_path
+  // in a separate stream, reads a window around the anchor offset and builds
+  // the KWIC snippet via BuildKwicSnippet; on std::nullopt (file missing,
+  // shorter, or the anchor term is not at the offset) the document's static
+  // snippet is used (Requirement 12.6-12.10). Performs no locking: file
+  // reads happen outside every lock (Requirement 12.7).
+  static std::vector<SearchResult> AttachSnippets(
+      const std::string& dataset_dir, const InvertedIndex& index,
+      const std::vector<RankedDocument>& ranked);
 
   IndexStats Stats() const;
 

@@ -722,8 +722,10 @@ void CheckIndexDeterminismAcrossThreadCounts() {
         const auto r2 = Ranker::Rank(terms, *other.index, top_k);
         bool same = r1.size() == r2.size();
         for (size_t i = 0; same && i < r1.size(); ++i) {
-          same = r1[i].doc_id == r2[i].doc_id && r1[i].score == r2[i].score &&
-                 r1[i].snippet == r2[i].snippet;
+          same = r1[i].doc_index == r2[i].doc_index &&
+                 r1[i].score == r2[i].score &&
+                 r1[i].anchor_offset == r2[i].anchor_offset &&
+                 r1[i].anchor_term == r2[i].anchor_term;
         }
         Check(same, "determinism: search results equal across thread counts");
       }

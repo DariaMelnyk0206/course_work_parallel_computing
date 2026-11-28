@@ -1,10 +1,14 @@
 #include "search_service.h"
 
 #include <cstddef>
+#include <filesystem>
+#include <optional>
 #include <unordered_set>
 #include <utility>
 
 #include "index_builder.h"
+#include "logger.h"
+#include "snippet.h"
 #include "striped_hash_table.h"
 #include "tokenizer.h"
 
@@ -93,14 +97,38 @@ KeywordSearchOutcome SearchService::RunKeywordSearch(
   const auto start = std::chrono::steady_clock::now();
   std::shared_ptr<const InvertedIndex> index = CurrentIndex();
   if (index != nullptr && !expansion.weighted_terms.empty()) {
-    outcome.results = Ranker::Rank(expansion.weighted_terms, *index,
-                                   config_.top_k, &outcome.total_matches);
+    const std::vector<RankedDocument> ranked =
+        Ranker::Rank(expansion.weighted_terms, *index, config_.top_k,
+                     &outcome.total_matches);
+    outcome.results = AttachSnippets(config_.dataset_dir, *index, ranked);
   }
   outcome.search_time_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - start)
           .count();
   return outcome;
+}
+
+std::vector<SearchResult> SearchService::AttachSnippets(
+    const std::string& dataset_dir, const InvertedIndex& index,
+    const std::vector<RankedDocument>& ranked) {
+  std::vector<SearchResult> results;
+  results.reserve(ranked.size());
+  for (const RankedDocument& doc : ranked) {
+    const DocumentInfo& info = index.Documents().Get(doc.doc_index);
+    const std::string path =
+        (std::filesystem::path(dataset_dir) / info.relative_path).string();
+    std::optional<std::string> kwic =
+        BuildKwicSnippet(path, doc.anchor_offset, doc.anchor_term);
+    if (!kwic.has_value()) {
+      Logger::Instance().Info("KWIC snippet unavailable for " + info.name +
+                              ", using static snippet");
+    }
+    results.push_back({info.name, doc.score,
+                       kwic.has_value() ? std::move(*kwic) : info.snippet,
+                       info.title});
+  }
+  return results;
 }
 
 IndexStats SearchService::Stats() const {
