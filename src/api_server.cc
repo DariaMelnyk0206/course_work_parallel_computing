@@ -50,6 +50,7 @@ ApiServer::ApiServer(Config config, std::shared_ptr<SearchService> service)
   RegisterHealth();
   RegisterIndex();
   RegisterStats();
+  RegisterErrorHandling();
 }
 
 bool ApiServer::Listen() {
@@ -142,6 +143,45 @@ void ApiServer::RegisterStats() {
 }
 
 void ApiServer::RegisterWebSocket() {}
-void ApiServer::RegisterErrorHandling() {}
+void ApiServer::RegisterErrorHandling() {
+  // Fills a JSON body for any error without one (404, 405, 413, ...). Bodies
+  // set by route handlers are left untouched.
+  server_.set_error_handler([](const httplib::Request&,
+                               httplib::Response& res) {
+    if (!res.body.empty()) return;
+    switch (res.status) {
+      case 404:
+        SetError(res, 404, "Not found");
+        break;
+      case 405:
+        SetError(res, 405, "Method not allowed");
+        break;
+      case 413:
+        SetError(res, 413, "Payload too large");
+        break;
+      case 500:
+        SetError(res, 500, "Internal server error");
+        break;
+      default:
+        SetError(res, res.status,
+                 res.status >= 500 ? "Internal server error" : "Bad request");
+        break;
+    }
+  });
+  server_.set_exception_handler([](const httplib::Request& req,
+                                   httplib::Response& res,
+                                   std::exception_ptr ep) {
+    try {
+      if (ep) std::rethrow_exception(ep);
+    } catch (const std::exception& e) {
+      Logger::Instance().Error(req.method + " " + req.path +
+                               " failed: " + e.what());
+    } catch (...) {
+      Logger::Instance().Error(req.method + " " + req.path +
+                               " failed: unknown exception");
+    }
+    SetError(res, 500, "Internal server error");
+  });
+}
 
 }  // namespace search_engine
