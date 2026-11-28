@@ -18,11 +18,11 @@ Api -> Api : validate JSON and 'threads' (1..256)
 alt invalid input
   Api --> Client : 400 {"error": ...}
 end
-Api -> Svc : BuildIndex(N)
+Api -> Svc : BuildIndex(N, &documents, &time_ms)
 activate Svc
-Svc -> Svc : indexing_ CAS(false -> true)
+Svc -> Svc : IndexingGuard: indexing_in_progress_\ncompare_exchange_strong(false -> true)
 alt already running
-  Svc --> Api : conflict
+  Svc --> Api : IndexOutcome::kAlreadyInProgress
   Api --> Client : 409 {"error": "Indexing already in progress"}
 end
 Svc -> Builder : Build(dataset_dir, N)
@@ -30,7 +30,7 @@ activate Builder
 Builder -> Builder : start steady_clock timer
 Builder -> Builder : scan dataset, sort file list\n(sequential part)
 Builder -> Table : create new StripedHashTable
-Builder -> Docs : allocate slots[file_count]
+Builder -> Docs : allocate slots[file_count]\n(before any task starts)
 Builder -> Pool : create ThreadPool(N), unbounded queue
 loop for each file
   Builder -> Pool : Submit(task(doc_id)) -> future
@@ -39,8 +39,11 @@ end
 par one task per file, running on index_pool workers
   Pool -> Worker : run task(doc_id)
   activate Worker
-  Worker -> Worker : read file into buffer
-  Worker -> Worker : build snippet
+  Worker -> Worker : read file into buffer (binary)
+  alt file unreadable
+    Worker -> Worker : log warning, skip\n(slot stays valid=false, not counted)
+  end
+  Worker -> Worker : MakeSnippet(content)
   Worker -> Worker : tokenize into local unordered_set\n(local aggregation, no locks)
   Worker -> Worker : FNV-1a hash per term,\ngroup terms by stripe
   loop for each stripe with terms
@@ -60,14 +63,15 @@ end
 
 Builder -> Pool : future.get() for every task\n(happens-before)
 Builder -> Pool : destroy index_pool (shutdown, join)
+Builder -> Builder : log documents and UniqueTermCount()
+Builder -> Builder : make_shared<const InvertedIndex>(table, docs, count)
 Builder -> Builder : stop timer, time_ms
 Builder --> Svc : IndexBuildResult(documents, time_ms)
 deactivate Builder
 
-Svc -> Svc : lock(mutex) swap shared_ptr<const InvertedIndex>\n(publish snapshot), unlock
-Svc -> Svc : update stats (documents, time, threads_used = N)
-Svc -> Svc : indexing_ = false
-Svc --> Api : IndexOutcome ok
+Svc -> Svc : PublishIndex: lock(index_mutex_), swap shared_ptr<const InvertedIndex>,\nupdate stats (documents, time, threads_used = N), unlock
+Svc -> Svc : ~IndexingGuard: indexing_in_progress_ = false\n(also on exception)
+Svc --> Api : IndexOutcome::kOk
 deactivate Svc
 Api --> Client : 200 {"status": "ok", "documents_indexed": D, "time_ms": T}
 deactivate Api

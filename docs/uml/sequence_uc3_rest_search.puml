@@ -16,46 +16,49 @@ Cli -> Api : POST /api/search\n{"query": "...", "mode": "keyword"}
 note right of Api
   З'єднання обслуговує окремий потік request_pool
 end note
-Api -> Api : валідація JSON, query, mode
+Api -> Api : t0 = steady_clock::now(),\nвалідація JSON, query, mode
 alt невалідний запит
   Api --> Cli : 400 {"error": "..."}
 else валідний запит
-  Api -> Svc : Search(query)
-  Svc -> Svc : t0 = steady_clock::now()
+  Api -> Svc : ExpandQuery(query)
   Svc -> Tok : Tokenize(query)
-  Tok --> Svc : оригінальні терміни
-  Svc -> Ollama : Expand(query, original_terms)
-  Ollama -> Mtx : try_lock_for(залишок LLM_TIMEOUT_MS)
-  alt м'ютекс отримано в межах бюджету
-    Ollama -> Llm : POST /api/generate (timeout = залишок бюджету)
-    alt успішна відповідь
-      Llm --> Ollama : response
-      Ollama -> Tok : Tokenize(response)
+  Tok --> Svc : оригінальні терміни (унікальні)
+  alt EXPANSION=off
+    Svc -> Svc : Expand не викликається, new_terms = []
+  else EXPANSION=on
+    Svc -> Ollama : Expand(query, original_terms)
+    Ollama -> Mtx : try_lock_until(now + LLM_TIMEOUT_MS)
+    alt м'ютекс отримано в межах бюджету
+      Ollama -> Llm : POST /api/generate (timeout = залишок бюджету)
       Ollama -> Mtx : unlock()
-      Ollama --> Svc : нові терміни (≤ 10)
-    else помилка / тайм-аут HTTP / порожній розбір
-      Ollama -> Mtx : unlock()
+      alt успішна відповідь з новими термінами
+        Llm --> Ollama : response
+        Ollama -> Tok : Tokenize(response)
+        Ollama --> Svc : нові терміни (≤ 10)
+      else помилка / тайм-аут HTTP / порожній розбір
+        Ollama --> Svc : fallback: порожній список, подія в лог
+      end
+    else бюджет вичерпано в черзі
       Ollama --> Svc : fallback: порожній список, подія в лог
     end
-  else бюджет вичерпано в черзі
-    Ollama --> Svc : fallback: порожній список, подія в лог
   end
+  Svc --> Api : QueryExpansion\n(expanded_terms = оригінальні w=2 + нові w=1)
   note over Svc
-    expanded_terms = оригінальні (w=2) + нові (w=1).
     М'ютекс LLM вже звільнено, індекс під час очікування LLM не блокується.
   end note
-  Svc -> Svc : знімок = копія shared_ptr під коротким mutex
-  loop для кожного терміна з expanded_terms
-    Svc -> Idx : Lookup(term)
-    Idx -> Tbl : Lookup(term, hash)
+  Api -> Svc : RunKeywordSearch(expansion)
+  Svc -> Svc : CurrentIndex() (копія shared_ptr під index_mutex_)
+  Svc -> Rank : Rank(weighted_terms, *index, top_k)
+  loop для кожного унікального терміна
+    Rank -> Idx : Table()
+    Rank -> Tbl : Lookup(term, hash)
     note right of Tbl : shared_lock на один стрип,\nкопія списку постингів
-    Tbl --> Idx : postings
-    Idx --> Svc : postings (df = size)
+    Tbl --> Rank : postings (df = size)
   end
-  Svc -> Rank : Rank(postings, N, top_k)
-  Rank --> Svc : top-k за score, snippet із DocumentTable
-  Svc -> Svc : time_ms = повний час (expansion + пошук)
-  Svc --> Api : результати, time_ms
+  Rank -> Idx : Documents().Get(doc_id) для snippet
+  Rank --> Svc : top-k за score
+  Svc --> Api : KeywordSearchOutcome
+  Api -> Api : time_ms = повний час від t0 (expansion + пошук)
   Api --> Cli : 200 {"results": [{doc_id, score, snippet}], "time_ms": T}
 end
 note over Cli, Api

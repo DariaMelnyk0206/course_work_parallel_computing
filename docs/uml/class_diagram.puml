@@ -194,7 +194,13 @@ package search_engine {
     -PublishIndex(next, docs, build_time_ms, threads): void
   }
 
-  class "SearchService::IndexingGuard" as IndexingGuard <<private>>
+  class "SearchService::IndexingGuard" as IndexingGuard <<private, RAII>> {
+    -flag_: atomic<bool>&
+    -acquired_: bool
+    +IndexingGuard(flag: atomic<bool>&)
+    +~IndexingGuard()
+    +acquired(): bool
+  }
 
   class ApiServer {
     -config_: Config
@@ -247,7 +253,7 @@ ApiServer o-- SearchService : shared_ptr
 IndexBuildResult o-- InvertedIndex : shared_ptr<const>
 
 ' Dependencies
-ApiServer ..> ThreadPool : <<create>> via\nServer::new_task_queue\n(httplib owns the pool)
+ApiServer ..> ThreadPool : <<use>> creates via the\nnew_task_queue factory\n(not an owner: httplib owns the pool)
 HttpServer ..> TaskQueue : owns via unique_ptr
 SearchService ..> IndexBuilder
 SearchService ..> Ranker
@@ -255,14 +261,25 @@ SearchService ..> Tokenizer
 SearchService ..> QueryExpansion : <<create>>
 SearchService ..> KeywordSearchOutcome : <<create>>
 SearchService ..> IndexOutcome
+SearchService ..> IndexBuildResult
+SearchService ..> ExpansionResult
+SearchService ..> StripedHashTable : Fnv1aHash64
+ApiServer ..> QueryExpansion
+ApiServer ..> KeywordSearchOutcome
+ApiServer ..> IndexOutcome
 IndexBuilder ..> IndexBuildResult : <<create>>
 IndexBuilder ..> ThreadPool : index_pool (Submit)
 IndexBuilder ..> InvertedIndex : <<create>>
+IndexBuilder ..> StripedHashTable : <<create>>
+IndexBuilder ..> DocumentTable : <<create>>
+IndexBuilder ..> Logger
 IndexBuilder ..> Tokenizer
 IndexBuilder ..> Snippet
 IndexBuilder ..> StripedInsertItem
 IndexBuilder ..> DocumentInfo
 Ranker ..> InvertedIndex
+Ranker ..> StripedHashTable : Lookup (shared_lock)
+Ranker ..> DocumentInfo : name, snippet
 Ranker ..> WeightedTerm
 Ranker ..> SearchResult : <<create>>
 QueryExpansion o-- "0..*" WeightedTerm

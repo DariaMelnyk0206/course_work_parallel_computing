@@ -11,9 +11,9 @@ participant "Tokenizer" as TK
 participant "OllamaClient" as OC
 participant "generate_mutex_\n(std::timed_mutex)" as MX
 participant "Ollama\n(контейнер)" as OL
+participant "Ranker" as RK
 participant "InvertedIndex\n(знімок)" as IDX
 participant "StripedHashTable\n(shared_mutex стрипа)" as HT
-participant "Ranker" as RK
 
 U -> UI : вводить запит
 UI -> API : WebSocket connect /ws/search
@@ -21,8 +21,9 @@ API -> RP : enqueue(з'єднання)
 activate RP
 note right of RP : Потік request_pool обслуговує\nвсю WS-сесію
 
+loop поки з'єднання відкрите (ws.read)
 UI -> RP : {"query": "..."}
-RP -> RP : валідація JSON і query
+RP -> RP : t0 = steady_clock::now(),\nвалідація JSON і query
 alt невалідний JSON або порожній query
   RP --> UI : {"stage":"error","data":{"message":"..."}}
   RP -> UI : close(1008)
@@ -31,48 +32,62 @@ else запит коректний
   RP -> SVC : ExpandQuery(query)
   SVC -> TK : Tokenize(query)
   TK --> SVC : original_terms
+  alt EXPANSION=off
+    SVC -> SVC : Expand не викликається, new_terms = []
+  else EXPANSION=on
   SVC -> OC : Expand(query, original_terms)
-  OC -> MX : try_lock_for(LLM_TIMEOUT_MS)
+  OC -> MX : try_lock_until(now + LLM_TIMEOUT_MS)
   alt м'ютекс отримано в межах бюджету
     MX --> OC : locked
     OC -> OL : POST /api/generate (read timeout = залишок бюджету)
     alt Ollama відповіла вчасно
       OL --> OC : response
+      OC -> MX : unlock()
+      OC -> OC : прибрати префікс "Keywords:"
       OC -> TK : Tokenize(response)
       TK --> OC : терміни
       OC -> OC : dedup, прибрати original_terms,\nне більше 10 нових
+      note right of OC : порожній розбір, не-200 або\nнекоректна відповідь теж дають fallback
     else тайм-аут або HTTP-помилка
       OL --> OC : помилка
-      OC -> OC : fallback: new_terms = [] (запис у лог)
+      OC -> MX : unlock()
+      OC -> OC : fallback: new_terms = [], used_fallback (запис у лог)
     end
-    OC -> MX : unlock()
   else бюджет вичерпано в черзі
     MX --> OC : не отримано
     OC -> OC : fallback: new_terms = [] (запис у лог)
   end
   note over OC, MX : М'ютекс LLM звільнено до звернення до індексу
-  OC --> SVC : new_terms
-  SVC --> RP : QueryExpansion\n(original_terms + new_terms)
+  OC --> SVC : ExpansionResult(new_terms, used_fallback)
+  end
+  SVC -> SVC : expanded_terms = original_terms + new_terms,\nweighted_terms (w=2 / w=1, FNV-1a hash)
+  SVC --> RP : QueryExpansion
   RP --> UI : {"stage":"query_expansion","data":{"original","expanded_terms"}}
 
   == Етап 2: keyword_search ==
   RP -> SVC : RunKeywordSearch(expansion)
-  SVC -> SVC : CurrentIndex() (копія shared_ptr під mutex)
-  loop кожен термін t з expanded_terms
-    SVC -> IDX : Lookup(t)
-    IDX -> HT : Lookup(t, hash)
-    HT -> HT : shared_lock на стрип,\nкопія постингів
-    HT --> IDX : postings
-    IDX --> SVC : postings
+  SVC -> SVC : CurrentIndex() (копія shared_ptr під index_mutex_)
+  alt знімка немає або weighted_terms порожні
+    SVC -> SVC : results = []
+  else
+    SVC -> RK : Rank(weighted_terms, *index, top_k)
+    loop кожен унікальний термін
+      RK -> IDX : Table()
+      RK -> HT : Lookup(term, hash)
+      HT -> HT : shared_lock на стрип,\nкопія постингів
+      HT --> RK : postings (df = size)
+    end
+    RK -> RK : IDF, нормований score, сортування, top-K
+    RK -> IDX : Documents().Get(doc_id) для snippet
+    RK --> SVC : results (doc_id, score, snippet)
   end
-  SVC -> RK : Rank(weighted_terms, postings)
-  RK --> SVC : top-K результатів (score, doc_id)
-  SVC --> RP : results, search_time_ms
+  SVC --> RP : KeywordSearchOutcome(results, search_time_ms)
   RP --> UI : {"stage":"keyword_search","data":{"results","time_ms"}}
 
   == Етап 3: done ==
   RP --> UI : {"stage":"done","data":{"total_time_ms"}}
-  note right of UI : З'єднання лишається відкритим;\nWeb UI закриває його після done
+  note right of UI : З'єднання лишається відкритим для наступного запиту;\nпотік request_pool повертається в пул після закриття
+end
 end
 deactivate RP
 UI -> U : відображає етапи, expanded_terms і результати
