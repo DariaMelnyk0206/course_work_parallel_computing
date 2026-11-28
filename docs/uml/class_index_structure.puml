@@ -1,0 +1,63 @@
+@startuml class_index_structure
+title Діаграма класів: структура даних індексу
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+hide empty members
+
+class InvertedIndex {
+  -document_count_ : uint32_t
+  +Table()
+  +Documents()
+  +DocumentCount()
+}
+
+class StripedHashTable {
+  -buckets_ : vector<vector<Entry>>
+  -stripes_ : vector<shared_mutex>
+  +InsertBatch(stripe, items)
+  +Lookup(term, hash)
+  +{static} Fnv1aHash64(term)
+}
+
+class "StripedHashTable::Entry" as Entry <<struct>> {
+  +term : string
+  +postings : vector<Posting>
+}
+
+class Posting <<struct>> {
+  +doc_id : uint32_t
+  +offset : uint32_t
+}
+
+class DocumentTable {
+  -documents_ : vector<DocumentInfo>
+  +Set(doc_id, info)
+  +Get(doc_id)
+}
+
+class DocumentInfo <<struct>> {
+  +name : string
+  +relative_path : string
+  +title : string
+  +snippet : string
+  +valid : bool
+}
+
+InvertedIndex *-- StripedHashTable
+InvertedIndex *-- DocumentTable
+StripedHashTable *-- "0..*" Entry : ланцюжок у бакеті
+Entry *-- "0..*" Posting
+DocumentTable *-- "0..*" DocumentInfo
+
+note right of Posting
+  offset — байтовий зсув першого
+  входження терміна в документі
+end note
+
+note bottom of StripedHashTable
+  бакет = h & (B−1), стрип = бакет & (S−1)
+  B = 2^21, S = 1024
+  запис: unique_lock на стрип
+  читання: shared_lock на стрип
+end note
+@enduml

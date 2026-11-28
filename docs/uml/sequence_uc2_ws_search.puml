@@ -1,101 +1,34 @@
 @startuml sequence_uc2_ws_search
 title UC-2: Пошук зі стрімінгом етапів (WS /ws/search)
+skinparam shadowing false
 skinparam responseMessageBelowArrow true
-actor "Користувач Web UI" as U
-participant "Web UI (app.js)" as UI
-participant "ApiServer\n(httplib)" as API
-participant "request_pool\n(ThreadPool)" as RP
-participant "SearchService" as SVC
-participant "Tokenizer" as TK
-participant "OllamaClient" as OC
-participant "generate_mutex_\n(std::timed_mutex)" as MX
-participant "Ollama\n(контейнер)" as OL
-participant "Ranker" as RK
-participant "InvertedIndex\n(знімок)" as IDX
-participant "StripedHashTable\n(shared_mutex стрипа)" as HT
-participant "Файли корпусу\n(DATASET_DIR)" as FS
+actor "Користувач" as U
+participant "Web UI" as UI
+participant "ApiServer\n(потік request_pool)" as Api
+participant SearchService as Svc
+participant OllamaClient as Oc
+participant Ollama as Llm
+participant Ranker as Rank
+participant "Індекс" as Idx
+
 U -> UI : вводить запит
-UI -> API : WebSocket connect /ws/search
-API -> RP : enqueue(з'єднання)
-activate RP
-note right of RP : Потік request_pool обслуговує\nвсю WS-сесію
-loop поки з'єднання відкрите (ws.read)
-UI -> RP : {"query": "..."}
-RP -> RP : t0 = steady_clock::now(),\nвалідація JSON і query
+UI -> Api : WebSocket connect /ws/search
+note right of Api : Потік request_pool обслуговує всю WS-сесію
+UI -> Api : {"query": "..."}
+Api -> Api : t0 = steady_clock::now(), валідація JSON і query
 alt невалідний JSON або порожній query
-  RP --> UI : {"stage":"error","data":{"message":"..."}}
-  RP -> UI : close(1008)
+  Api --> UI : {"stage": "error", "data": {"message": "..."}}
+  Api -> UI : close(1008)
 else запит коректний
   == Етап 1: query_expansion ==
-  RP -> SVC : ExpandQuery(query)
-  SVC -> TK : Tokenize(query)
-  TK --> SVC : original_terms
-  alt EXPANSION=off
-    SVC -> SVC : Expand не викликається, new_terms = []
-  else EXPANSION=on
-  SVC -> OC : Expand(query, original_terms)
-  OC -> MX : try_lock_until(now + LLM_TIMEOUT_MS)
-  alt м'ютекс отримано в межах бюджету
-    MX --> OC : locked
-    OC -> OL : POST /api/generate (read timeout = залишок бюджету)
-    alt Ollama відповіла вчасно
-      OL --> OC : response
-      OC -> MX : unlock()
-      OC -> OC : прибрати префікс "Keywords:"
-      OC -> TK : Tokenize(response)
-      TK --> OC : терміни
-      OC -> OC : dedup, прибрати original_terms,\nне більше 10 нових
-      note right of OC : порожній розбір, не-200 або\nнекоректна відповідь теж дають fallback
-    else тайм-аут або HTTP-помилка
-      OL --> OC : помилка
-      OC -> MX : unlock()
-      OC -> OC : fallback: new_terms = [], used_fallback (запис у лог)
-    end
-  else бюджет вичерпано в черзі
-    MX --> OC : не отримано
-    OC -> OC : fallback: new_terms = [] (запис у лог)
-  end
-  note over OC, MX : М'ютекс LLM звільнено до звернення до індексу
-  OC --> SVC : ExpansionResult(new_terms, used_fallback)
-  end
-  SVC -> SVC : expanded_terms = original_terms + new_terms,\nweighted_terms (w=2 / w=1, FNV-1a hash)
-  SVC --> RP : QueryExpansion
-  RP --> UI : {"stage":"query_expansion","data":{"original","expanded_terms"}}
+  ref over Api, Llm : Розширення запиту (UC-3):\nExpandQuery → Tokenize, try_lock_for(LLM_TIMEOUT_MS),\nPOST /api/generate або fallback
+  Api --> UI : {"stage": "query_expansion", "data": {original, expanded_terms}}
   == Етап 2: keyword_search ==
-  RP -> SVC : RunKeywordSearch(expansion)
-  SVC -> SVC : CurrentIndex() (копія shared_ptr під index_mutex_)
-  alt знімка немає або weighted_terms порожні
-    SVC -> SVC : results = []
-  else
-    SVC -> RK : Rank(weighted_terms, *index, top_k)
-    loop кожен унікальний термін
-      RK -> IDX : Table()
-      RK -> HT : Lookup(term, hash)
-      HT -> HT : shared_lock на стрип,\nкопія постингів
-      HT --> RK : postings (df = size)
-    end
-    RK -> RK : IDF, нормований score, якір (зсув терміна\nз найбільшою вагою w·IDF), сортування, top-K
-    RK --> SVC : vector<RankedDocument>\n(doc_index, score, anchor_offset, anchor_term), total_matches
-    note over SVC, HT : Усі shared_lock на стрипи вже відпущено
-    SVC -> SVC : AttachSnippets(dataset_dir, *index, ranked)
-    loop кожен документ із top-K (поза будь-якими блокуваннями)
-      SVC -> IDX : Documents().Get(doc_index)\n(relative_path, title, статичний snippet)
-      SVC -> FS : BuildKwicSnippet(path, anchor_offset, anchor_term)\nвідкрити файл, прочитати вікно ±100 байтів
-      alt за зсувом стоїть anchor_term
-        FS --> SVC : KWIC-snippet (≤ 160 байтів, "..." по краях)
-      else файл недоступний, коротший або термін не збігся
-        FS --> SVC : std::nullopt
-        SVC -> SVC : резервний статичний snippet з DocumentInfo
-      end
-    end
-  end
-  SVC --> RP : KeywordSearchOutcome(results, total_matches, search_time_ms)\n(search_time_ms включає читання вікон)
-  RP --> UI : {"stage":"keyword_search","data":{"results" (з title),"time_ms","total_matches"}}
+  ref over Api, Idx : Пошук за ключовими словами (UC-3):\nRank → Lookup під shared_lock, KWIC-вікна для top-k
+  Api --> UI : {"stage": "keyword_search", "data": {results, time_ms, total_matches}}
   == Етап 3: done ==
-  RP --> UI : {"stage":"done","data":{"total_time_ms"}}
-  note right of UI : З'єднання лишається відкритим для наступного запиту;\nпотік request_pool повертається в пул після закриття
+  Api --> UI : {"stage": "done", "data": {total_time_ms}}
+  note right of UI : З'єднання лишається відкритим для наступного запиту
 end
-end
-deactivate RP
-UI -> U : відображає етапи, expanded_terms і результати
+UI -> U : показує етапи, expanded_terms і результати
 @enduml

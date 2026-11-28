@@ -1,78 +1,51 @@
 @startuml sequence_uc1_index
-title UC-1: Index the corpus (POST /api/index)
+title UC-1: Індексація корпусу (POST /api/index)
 skinparam shadowing false
 skinparam sequenceMessageAlign center
-actor "Web UI / CLI" as Client
-participant "ApiServer\n(request_pool thread)" as Api
+actor "Клієнт\n(Web UI / CLI)" as Client
+participant "ApiServer\n(потік request_pool)" as Api
 participant SearchService as Svc
 participant IndexBuilder as Builder
-participant "index_pool\n(ThreadPool, N)" as Pool
-participant "Worker i\n(index_pool thread)" as Worker
+participant "Воркер\n(потік index_pool)" as Worker
 participant StripedHashTable as Table
 participant DocumentTable as Docs
+
 Client -> Api : POST /api/index {"threads": N}
-activate Api
-Api -> Api : validate JSON and 'threads' (1..256)
-alt invalid input
-  Api --> Client : 400 {"error": ...}
-end
-Api -> Svc : BuildIndex(N, &documents, &time_ms)
-activate Svc
-Svc -> Svc : IndexingGuard: indexing_in_progress_\ncompare_exchange_strong(false -> true)
-alt already running
-  Svc --> Api : IndexOutcome::kAlreadyInProgress
-  Api --> Client : 409 {"error": "Indexing already in progress"}
-end
-Svc -> Builder : Build(dataset_dir, N)
-activate Builder
-Builder -> Builder : start steady_clock timer
-Builder -> Builder : scan dataset, sort file list\n(sequential part)
-Builder -> Builder : if dataset_dir/metadata.csv exists:\nParseMetadataLine per row -> id to "title (year)" map\n(sequential part; else log Info, titles empty)
-Builder -> Table : create new StripedHashTable
-Builder -> Docs : allocate slots[file_count]\n(before any task starts)
-Builder -> Pool : create ThreadPool(N), unbounded queue
-loop for each file
-  Builder -> Pool : Submit(task(doc_id)) -> future
-end
-par one task per file, running on index_pool workers
-  Pool -> Worker : run task(doc_id)
-  activate Worker
-  Worker -> Worker : read file into buffer (binary)
-  alt file unreadable
-    Worker -> Worker : log warning, skip\n(slot stays valid=false, not counted)
+Api -> Api : валідація JSON і threads (1..256)
+alt невалідний запит
+  Api --> Client : 400 {"error": "..."}
+else валідний запит
+  Api -> Svc : BuildIndex(N)
+  Svc -> Svc : indexing_in_progress_.compare_exchange_strong(false → true)
+  alt індексація вже виконується
+    Svc --> Api : kAlreadyInProgress
+    Api --> Client : 409 {"error": "Indexing already in progress"}
+  else прапорець захоплено
+    Svc -> Builder : Build(dataset_dir, N)
+    note over Builder : Послідовна частина (закон Амдала)
+    Builder -> Builder : старт таймера, сканування і сортування файлів
+    Builder -> Builder : завантаження назв із metadata.csv (якщо є)
+    Builder -> Table : створити StripedHashTable
+    Builder -> Docs : виділити слоти [кількість файлів]
+    Builder -> Builder : створити index_pool(N), одна задача на файл
+    par задачі воркерів index_pool (по одній на файл)
+      Builder -> Worker : Submit(задача doc_id) → future
+      Worker -> Worker : читання файлу, snippet, токенізація зі зсувами,\nFNV-1a, групування за стрипами
+      note right of Worker : локальна агрегація, без блокувань
+      loop кожен стрип із термінами
+        Worker -> Table : InsertBatch(stripe, items)
+        note right of Table : unique_lock на стрип\n(не більше одного одночасно)
+      end
+      Worker -> Docs : запис DocumentInfo у свій слот (без блокувань)
+      Worker -> Worker : лічильник документів fetch_add(1)
+    end
+    Builder -> Builder : future.get() для кожної задачі,\nзнищення index_pool
+    Builder -> Builder : make_shared<const InvertedIndex>, зупинка таймера
+    Builder --> Svc : IndexBuildResult
+    Svc -> Svc : публікація знімка під index_mutex_\n(заміна shared_ptr, оновлення статистики)
+    Svc --> Api : kOk
+    Api --> Client : 200 {"status": "ok", "documents_indexed", "time_ms"}
   end
-  Worker -> Worker : MakeSnippet(content)
-  Worker -> Worker : TokenizeWithOffsets into local\nunordered_map term -> first offset\n(local aggregation, no locks)
-  Worker -> Worker : FNV-1a hash per term,\ngroup terms by stripe
-  loop for each stripe with terms
-    Worker -> Table : InsertBatch(stripe, items)
-    activate Table
-    Table -> Table : unique_lock(stripe mutex)
-    Table -> Table : append Posting{doc_id, offset} to postings
-    Table -> Table : unlock
-    Table --> Worker
-    deactivate Table
-  end
-  Worker -> Docs : write DocumentInfo (name, relative_path,\ntitle, snippet) into own slot[doc_id]\n(no lock)
-  Worker -> Worker : indexed_count.fetch_add(1)
-  Worker --> Pool : future ready
-  deactivate Worker
 end
-Builder -> Pool : future.get() for every task\n(happens-before)
-Builder -> Pool : destroy index_pool (shutdown, join)
-Builder -> Builder : log documents and UniqueTermCount()
-Builder -> Builder : make_shared<const InvertedIndex>(table, docs, count)
-Builder -> Builder : stop timer, time_ms
-Builder --> Svc : IndexBuildResult(documents, time_ms)
-deactivate Builder
-Svc -> Svc : PublishIndex: lock(index_mutex_), swap shared_ptr<const InvertedIndex>,\nupdate stats (documents, time, threads_used = N), unlock
-Svc -> Svc : ~IndexingGuard: indexing_in_progress_ = false\n(also on exception)
-Svc --> Api : IndexOutcome::kOk
-deactivate Svc
-Api --> Client : 200 {"status": "ok", "documents_indexed": D, "time_ms": T}
-deactivate Api
-note over Client, Docs
-  Searches running during the build keep using the old snapshot.
-  A search started after publication sees the new index.
-end note
+note over Client, Docs : Пошук під час побудови використовує старий знімок
 @enduml

@@ -1,37 +1,31 @@
 @startuml use_case
 left to right direction
 skinparam packageStyle rectangle
-
 actor "Користувач Web UI" as WebUser
 actor "Користувач CLI" as CliUser
 actor "Ollama" as Ollama <<secondary>>
-
 rectangle "Пошукова система (search-server)" {
-  usecase "UC-1 Індексація корпусу\n(POST /api/index)" as UC1
   usecase "UC-2 Пошук зі стрімінгом етапів\n(WS /ws/search)" as UC2
+  usecase "UC-1 Індексація корпусу\n(POST /api/index)" as UC1
   usecase "UC-3 Пошук через REST\n(POST /api/search)" as UC3
-  usecase "UC-4 Перегляд статистики\n(GET /api/stats)" as UC4
   usecase "UC-5 Перевірка стану\n(GET /api/health)" as UC5
+  usecase "UC-4 Перегляд статистики\n(GET /api/stats)" as UC4
   usecase "Розширення запиту через LLM" as UCExp
   usecase "Пошук за ключовими словами" as UCKw
 }
-
 WebUser --> UC1
 WebUser --> UC2
 WebUser --> UC3
 WebUser --> UC4
 WebUser --> UC5
-
 CliUser --> UC1
 CliUser --> UC3
 CliUser --> UC4
 CliUser --> UC5
-
 UC2 ..> UCExp : <<include>>
 UC2 ..> UCKw : <<include>>
 UC3 ..> UCExp : <<include>>
 UC3 ..> UCKw : <<include>>
-
 UCExp --> Ollama
 UC5 --> Ollama
 @enduml

@@ -1,297 +1,113 @@
 @startuml class_diagram
-title Class diagram (from src/*.h and cli/search_cli.h)
+title Діаграма класів: архітектура (за src/*.h)
 skinparam classAttributeIconSize 0
-skinparam linetype ortho
+skinparam shadowing false
 hide empty members
-package "httplib (external)" {
-  abstract class "httplib::TaskQueue" as TaskQueue {
-    {abstract} +enqueue(fn: function<void()>): bool
-    {abstract} +shutdown(): void
-  }
-  class "httplib::Server" as HttpServer
+
+abstract class "httplib::TaskQueue" as TaskQueue {
+  {abstract} +enqueue(fn)
+  {abstract} +shutdown()
 }
-package search_engine {
-  struct Config {
-    +port: int = 8080
-    +dataset_dir: string
-    +web_dir: string
-    +ollama_host: string
-    +ollama_model: string
-    +llm_timeout_ms: int = 5000
-    +expansion_enabled: bool = true
-    +request_threads: int = 64
-    +request_queue: int = 128
-    +max_index_threads: int = 256
-    +top_k: int = 20
-    +{static} FromEnvironment(): Config
-  }
-  class Logger <<singleton>> {
-    -mutex_: mutex
-    -Logger()
-    +{static} Instance(): Logger&
-    +Info(message: string): void
-    +Warn(message: string): void
-    +Error(message: string): void
-    -WriteLine(level: const char*, message: string): void
-  }
-  class ThreadPool <<final>> {
-    -workers_: vector<jthread>
-    -tasks_: queue<function<void()>>
-    -mutex_: mutex
-    -cv_: condition_variable
-    -capacity_: size_t
-    -stopping_: bool
-    +ThreadPool(num_threads: size_t, capacity: size_t)
-    +~ThreadPool()
-    +enqueue(fn: function<void()>): bool
-    +shutdown(): void
-    +Submit<F>(task: F): future<R>
-    -WorkerLoop(): void
-  }
-  struct TokenOffset {
-    +token: string
-    +offset: uint32_t
-  }
-  class Tokenizer {
-    +{static} Tokenize(text: string): vector<string>
-    +{static} TokenizeWithOffsets(text: string): vector<TokenOffset>
-  }
-  class "snippet.h" as Snippet <<functions>> {
-    +BuildKwicSnippet(file_path: string, offset: uint32_t, term: string): optional<string>
-    +MakeSnippet(content: string): string
-  }
-  struct DocumentInfo {
-    +name: string
-    +relative_path: string
-    +title: string
-    +snippet: string
-    +valid: bool
-  }
-  class DocumentTable {
-    -documents_: vector<DocumentInfo>
-    +DocumentTable(document_count: size_t)
-    +Set(doc_id: uint32_t, info: DocumentInfo): void
-    +Get(doc_id: uint32_t): const DocumentInfo&
-    +Size(): size_t
-  }
-  struct Posting {
-    +doc_id: uint32_t
-    +offset: uint32_t
-  }
-  struct StripedInsertItem {
-    +term: string
-    +hash: uint64_t
-    +doc_id: uint32_t
-    +offset: uint32_t
-  }
-  class StripedHashTable {
-    -num_buckets_: size_t
-    -num_stripes_: size_t
-    -buckets_: vector<vector<Entry>>
-    -stripes_: vector<shared_mutex>
-    +StripedHashTable(num_buckets: size_t, num_stripes: size_t)
-    +StripeFor(hash: uint64_t): size_t
-    +InsertBatch(stripe: size_t, items: vector<StripedInsertItem>): void
-    +Lookup(term: string, hash: uint64_t): vector<Posting>
-    +UniqueTermCount(): size_t
-    +{static} Fnv1aHash64(term: string): uint64_t
-    -BucketFor(hash: uint64_t): size_t
-  }
-  class "StripedHashTable::Entry" as Entry <<struct>> {
-    +term: string
-    +postings: vector<Posting>
-  }
-  class InvertedIndex {
-    -table_: StripedHashTable
-    -documents_: DocumentTable
-    -document_count_: uint32_t
-    +InvertedIndex(table, documents, document_count)
-    +Table(): const StripedHashTable&
-    +Documents(): const DocumentTable&
-    +DocumentCount(): uint32_t
-  }
-  struct IndexBuildResult {
-    +index: shared_ptr<const InvertedIndex>
-    +documents_indexed: uint32_t
-    +time_ms: int64_t
-  }
-  class IndexBuilder {
-    +{static} Build(dataset_dir: string, num_threads: int): IndexBuildResult
-    +{static} ParseMetadataLine(line: string): optional<MetadataRow>
-  }
-  struct "IndexBuilder::MetadataRow" as MetadataRow {
-    +id: string
-    +title: string
-    +year: string
-  }
-  struct WeightedTerm {
-    +term: string
-    +hash: uint64_t
-    +weight: double
-  }
-  struct RankedDocument {
-    +doc_index: uint32_t
-    +score: double
-    +anchor_offset: uint32_t
-    +anchor_term: string
-  }
-  struct SearchResult {
-    +doc_id: string
-    +score: double
-    +snippet: string
-    +title: string
-  }
-  class Ranker {
-    +{static} Rank(terms: vector<WeightedTerm>, index: InvertedIndex, top_k: int, total_matches: size_t*): vector<RankedDocument>
-  }
-  struct ExpansionResult {
-    +new_terms: vector<string>
-    +used_fallback: bool
-  }
-  class OllamaClient {
-    -host_: string
-    -model_: string
-    -timeout_: milliseconds
-    -generate_mutex_: timed_mutex
-    +OllamaClient(host, model, timeout)
-    +Expand(original_query: string, original_terms: vector<string>): ExpansionResult
-    +IsAvailable(): bool
-    +{static} BuildPrompt(original_query: string): string
-  }
-  struct IndexStats {
-    +documents: uint32_t
-    +index_build_time_ms: int64_t
-    +threads_used: int
-  }
-  enum IndexOutcome {
-    kOk
-    kAlreadyInProgress
-  }
-  struct QueryExpansion {
-    +original_terms: vector<string>
-    +new_terms: vector<string>
-    +expanded_terms: vector<string>
-    +weighted_terms: vector<WeightedTerm>
-    +used_fallback: bool
-  }
-  struct KeywordSearchOutcome {
-    +results: vector<SearchResult>
-    +total_matches: size_t
-    +search_time_ms: int64_t
-  }
-  class SearchService {
-    -config_: Config
-    -ollama_client_: OllamaClient
-    -index_mutex_: mutex
-    -index_: shared_ptr<const InvertedIndex>
-    -stats_: IndexStats
-    -indexing_in_progress_: atomic<bool>
-    +SearchService(config: Config)
-    +BuildIndex(num_threads: int, documents_indexed: uint32_t*, time_ms: int64_t*): IndexOutcome
-    +ExpandQuery(query: string): QueryExpansion
-    +RunKeywordSearch(expansion: QueryExpansion): KeywordSearchOutcome
-    +{static} AttachSnippets(dataset_dir: string, index: InvertedIndex, ranked: vector<RankedDocument>): vector<SearchResult>
-    +Stats(): IndexStats
-    +OllamaAvailable(): bool
-    -CurrentIndex(): shared_ptr<const InvertedIndex>
-    -PublishIndex(next, docs, build_time_ms, threads): void
-  }
-  class "SearchService::IndexingGuard" as IndexingGuard <<private, RAII>> {
-    -flag_: atomic<bool>&
-    -acquired_: bool
-    +IndexingGuard(flag: atomic<bool>&)
-    +~IndexingGuard()
-    +acquired(): bool
-  }
-  class ApiServer {
-    -config_: Config
-    -service_: shared_ptr<SearchService>
-    -server_: httplib::Server
-    +ApiServer(config: Config, service: shared_ptr<SearchService>)
-    +Listen(): bool
-    +Stop(): void
-    -RegisterHealth(): void
-    -RegisterIndex(): void
-    -RegisterSearch(): void
-    -RegisterStats(): void
-    -RegisterWebSocket(): void
-    -RegisterErrorHandling(): void
-  }
-  struct CliOptions {
-    +host: string
-    +query: string
-    +top_k: int = 20
-    +show_health: bool
-    +show_stats: bool
-    +index_threads: int
-  }
-  class "search_cli" as SearchCli <<functions>> {
-    +ParseArgs(argc: int, argv: char**, options: CliOptions*): int
-    +Run(options: CliOptions): int
-  }
+
+class Config <<struct>> {
+  +port, dataset_dir, web_dir
+  +ollama_host, ollama_model
+  +llm_timeout_ms, expansion_enabled
+  +request_threads, request_queue, top_k
+  +{static} FromEnvironment()
 }
-' Inheritance
+
+class ApiServer {
+  -config_
+  -service_
+  +Listen()
+  +Stop()
+}
+
+class SearchService {
+  -index_mutex_
+  -index_ : shared_ptr<const InvertedIndex>
+  -indexing_in_progress_ : atomic<bool>
+  +BuildIndex(num_threads, ...)
+  +ExpandQuery(query)
+  +RunKeywordSearch(expansion)
+  +Stats()
+  +OllamaAvailable()
+}
+
+class ThreadPool <<final>> {
+  -workers_ : vector<jthread>
+  -tasks_, mutex_, cv_
+  +enqueue(fn)
+  +shutdown()
+  +Submit(task)
+}
+
+class IndexBuilder {
+  +{static} Build(dataset_dir, num_threads)
+  +{static} ParseMetadataLine(line)
+}
+
+class InvertedIndex {
+  +Table()
+  +Documents()
+  +DocumentCount()
+}
+
+class StripedHashTable {
+  +InsertBatch(stripe, items)
+  +Lookup(term, hash)
+  +{static} Fnv1aHash64(term)
+}
+
+class DocumentTable {
+  +Set(doc_id, info)
+  +Get(doc_id)
+}
+
+class Ranker {
+  +{static} Rank(terms, index, top_k, ...)
+}
+
+class OllamaClient {
+  -generate_mutex_ : timed_mutex
+  +Expand(original_query, original_terms)
+  +IsAvailable()
+}
+
+class Tokenizer {
+  +{static} Tokenize(text)
+  +{static} TokenizeWithOffsets(text)
+}
+
 TaskQueue <|-- ThreadPool
-' Composition / ownership
+
+ApiServer ..> ThreadPool : «створює через new_task_queue»\n(request_pool; власник — httplib)
+IndexBuilder ..> ThreadPool : «створює» index_pool
+
+ApiServer *-- Config
+ApiServer o-- SearchService : shared_ptr
+SearchService *-- Config
+SearchService *-- OllamaClient
+SearchService o-- "0..1" InvertedIndex : поточний знімок\n(shared_ptr<const>)
 InvertedIndex *-- StripedHashTable
 InvertedIndex *-- DocumentTable
-DocumentTable *-- "0..*" DocumentInfo
-StripedHashTable *-- "0..*" Entry
-SearchService *-- OllamaClient
-SearchService *-- Config
-SearchService *-- IndexStats
-SearchService +-- IndexingGuard
-ApiServer *-- Config
-ApiServer *-- HttpServer
-' Associations / aggregation
-SearchService o-- "0..1" InvertedIndex : index_ (shared_ptr<const>)
-ApiServer o-- SearchService : shared_ptr
-IndexBuildResult o-- InvertedIndex : shared_ptr<const>
-' Dependencies
-ApiServer ..> ThreadPool : <<use>> creates via the\nnew_task_queue factory\n(not an owner: httplib owns the pool)
-HttpServer ..> TaskQueue : owns via unique_ptr
-SearchService ..> IndexBuilder
-SearchService ..> Ranker
+
+SearchService ..> IndexBuilder : Build → IndexBuildResult
+SearchService ..> Ranker : Rank → RankedDocument
 SearchService ..> Tokenizer
-SearchService ..> QueryExpansion : <<create>>
-SearchService ..> KeywordSearchOutcome : <<create>>
-SearchService ..> IndexOutcome
-SearchService ..> IndexBuildResult
-SearchService ..> ExpansionResult
-SearchService ..> StripedHashTable : Fnv1aHash64
-ApiServer ..> QueryExpansion
-ApiServer ..> KeywordSearchOutcome
-ApiServer ..> IndexOutcome
-IndexBuilder ..> IndexBuildResult : <<create>>
-IndexBuilder ..> ThreadPool : index_pool (Submit)
-IndexBuilder ..> InvertedIndex : <<create>>
-IndexBuilder ..> StripedHashTable : <<create>>
-IndexBuilder ..> DocumentTable : <<create>>
-IndexBuilder ..> Logger
+IndexBuilder ..> InvertedIndex : «створює»
 IndexBuilder ..> Tokenizer
-IndexBuilder ..> Snippet
-IndexBuilder ..> StripedInsertItem
-IndexBuilder +-- MetadataRow
-IndexBuilder ..> TokenOffset
-IndexBuilder ..> DocumentInfo
-Ranker ..> InvertedIndex
-Ranker ..> StripedHashTable : Lookup (shared_lock)
-Ranker ..> WeightedTerm
-Ranker ..> RankedDocument : <<create>>
-StripedHashTable o-- "0..*" Posting
-StripedHashTable ..> Posting : Lookup returns
-SearchService ..> RankedDocument
-SearchService ..> SearchResult : <<create>> (AttachSnippets)
-SearchService ..> Snippet : BuildKwicSnippet (file read, no locks)
-SearchService ..> DocumentInfo : relative_path, title, static snippet
-Tokenizer ..> TokenOffset : <<create>>
-QueryExpansion o-- "0..*" WeightedTerm
-KeywordSearchOutcome o-- "0..*" SearchResult
-StripedHashTable ..> StripedInsertItem
-OllamaClient ..> ExpansionResult : <<create>>
-OllamaClient ..> Tokenizer
-SearchService ..> Logger
-ApiServer ..> Logger
-OllamaClient ..> Logger
-SearchCli ..> CliOptions
+Ranker ..> InvertedIndex : Lookup
+OllamaClient ..> Tokenizer : розбір відповіді\n→ ExpansionResult
+
+note bottom of SearchService
+  ExpandQuery повертає QueryExpansion,
+  RunKeywordSearch повертає KeywordSearchOutcome,
+  Stats повертає IndexStats (лише типи результатів).
+end note
+
+note as N1
+  Logger (singleton) використовується всіма компонентами.
+end note
 @enduml
